@@ -140,7 +140,6 @@ def run_processing_pipeline(uploaded_files, eps_value, min_face_area, face_detec
     """
     try:
         # --- INITIALIZATION ---
-        cleanup_directory(OUTPUT_DIR)
         cleanup_directory(TEMP_UPLOAD_DIR)
         cleanup_directory(TEMP_CROP_DIR)
         os.makedirs(TEMP_UPLOAD_DIR)
@@ -264,7 +263,7 @@ def run_processing_pipeline(uploaded_files, eps_value, min_face_area, face_detec
 
         # This part is to restore compatibility with the old UI logic
         merge_candidates = []
-        cluster_to_dest_files = file_organizer.organize_by_cluster(cluster_to_original_files)
+        cluster_to_dest_files = file_organizer.organize_files_into_folders(cluster_to_original_files)
         
         people = {}
         if cluster_to_dest_files:
@@ -405,7 +404,7 @@ def main():
     # Register a cleanup function to be called upon script exit.
     # This will attempt to remove the sorted output directory.
     # Note: This may not run if the app is terminated forcefully.
-    atexit.register(cleanup_directory, OUTPUT_DIR)
+    # atexit.register(cleanup_directory, OUTPUT_DIR) # Disabling this as it causes premature deletion
 
     # --- Initialize Session State & Background Worker ---
     if 'file_op_queue' not in st.session_state:
@@ -543,6 +542,8 @@ def main():
 
             st.write("---")
             if st.button("Sort Photos", type="primary", use_container_width=True):
+                # Clean up previous results only when a new sort is initiated
+                cleanup_directory(OUTPUT_DIR)
                 with st.spinner("Analyzing and sorting your photos..."):
                     people, num_clusters, merge_candidates, temp_file_paths = run_processing_pipeline(
                         uploaded_files, eps_value, min_face_area, model_choice, max_workers, batch_size
@@ -658,8 +659,11 @@ def main():
                                 person1_dir = os.path.dirname(list(person1['files'])[0])
                                 person2_dir = os.path.dirname(list(person2['files'])[0])
                                 
-                                # Queue the background operation
-                                st.session_state.file_op_queue.put(('move_files_and_remove_dir', (person2_dir, person1_dir)))
+                                # Perform synchronously to avoid race conditions on UI rerun
+                                if os.path.isdir(person2_dir) and os.path.isdir(person1_dir):
+                                    for filename in os.listdir(person2_dir):
+                                        shutil.move(os.path.join(person2_dir, filename), os.path.join(person1_dir, filename))
+                                    shutil.rmtree(person2_dir)
                                 
                                 # Update the state immediately for UI responsiveness
                                 # Calculate the new paths for the moved files
@@ -807,19 +811,22 @@ def main():
                     
                     # Perform renames first
                     for person_id, old_name, new_name in renames_to_perform:
-                        person_data = st.session_state.people[person_id]
-                        
-                        old_dir = os.path.join(OUTPUT_DIR, old_name)
-                        new_dir = os.path.join(OUTPUT_DIR, new_name)
+                        if person_id in st.session_state.people: # Check if person exists
+                            person_data = st.session_state.people[person_id]
+                            
+                            old_dir = os.path.join(OUTPUT_DIR, old_name)
+                            new_dir = os.path.join(OUTPUT_DIR, new_name)
 
-                        # Queue the directory rename
-                        st.session_state.file_op_queue.put(('rename_dir', (old_dir, new_dir)))
-                        
-                        # Update file paths in state to reflect the new directory
-                        updated_file_paths = {os.path.join(new_dir, os.path.basename(f)) for f in person_data['files']}
-                        
-                        st.session_state.people[person_id]['name'] = new_name
-                        st.session_state.people[person_id]['files'] = updated_file_paths
+                            # Perform rename synchronously
+                            if os.path.isdir(old_dir):
+                                os.rename(old_dir, new_dir)
+                            
+                            # Update all file paths to reflect the new directory
+                            person_data['files'] = {os.path.join(new_dir, os.path.basename(f)) for f in person_data['files']}
+                            
+                            # Update the name
+                            person_data['name'] = new_name
+
 
                     # Then, perform deletions
                     for person_id in ids_to_delete:
