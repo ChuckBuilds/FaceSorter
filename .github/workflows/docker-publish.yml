@@ -28,6 +28,13 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
 
+      - name: Generate requirements.txt
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/app \
+            nvidia/cuda:11.8.0-devel-ubuntu20.04 \
+            sh -c "pip install pip-tools && pip-compile /app/requirements.in -o /app/requirements.txt"
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:

@@ -15,6 +15,12 @@ import threading
 from queue import Queue, Empty
 import atexit
 
+# Set LOKY_MAX_CPU_COUNT to avoid issues on Windows with wmic
+if os.name == 'nt': # Check if the OS is Windows
+    cpu_count = os.cpu_count()
+    if cpu_count is not None:
+        os.environ['LOKY_MAX_CPU_COUNT'] = str(cpu_count)
+
 # Suppress the specific UserWarning from face_recognition_models
 warnings.filterwarnings("ignore", category=UserWarning, message="pkg_resources is deprecated as an API")
 
@@ -430,10 +436,10 @@ def main():
         # Set a smart default for eps based on the chosen model
         default_eps = 0.4 if model_choice == 'cnn' else 0.6
         eps_help_text = (
-            "Lower values are stricter. 'cnn' model works best with values around 0.4. "
-            "'hog' model works best with values around 0.6. "
-            "Adjust if you find the same person is being split into different folders (increase eps) "
-            "or different people are being grouped together (decrease eps)."
+            "Controls how similar faces must be to be grouped. Lower is stricter."
+            " • If different people are in the same group, **decrease** this value."
+            " • If the same person is in multiple groups, **increase** this value."
+            " • Recommended start for 'cnn' is ~0.4. Recommended for 'hog' is ~0.6."
         )
 
         eps_value = st.sidebar.slider(
