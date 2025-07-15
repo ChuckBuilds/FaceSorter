@@ -183,11 +183,11 @@ def run_processing_pipeline(uploaded_files, eps_value, min_face_area, face_detec
         progress_bar = st.progress(0, text="Initializing...")
 
         with ProcessPoolExecutor(
-            max_workers=max_workers,
-            initializer=init_worker,
-            initargs=(face_detector_model,)
-        ) as executor:
-            
+                max_workers=max_workers,
+                initializer=init_worker,
+                initargs=(face_detector_model,)
+            ) as executor:
+        
             futures = []
             for path in temp_file_paths:
                 original_media_path = video_source_map.get(path, path)
@@ -200,7 +200,7 @@ def run_processing_pipeline(uploaded_files, eps_value, min_face_area, face_detec
                 
                 if result:
                     successful_results.append(result)
-                
+
                 # Update progress bar with granular information
                 progress_percentage = processed_files_count / total_files
                 progress_text = f"Processing file {processed_files_count}/{total_files}: {os.path.basename(result[4].name if result else '...')}"
