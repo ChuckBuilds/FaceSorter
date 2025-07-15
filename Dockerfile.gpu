@@ -1,11 +1,11 @@
-# Use the official NVIDIA CUDA runtime as a parent image
-FROM nvidia/cuda:11.8.0-runtime-ubuntu20.04
+# Stage 1: Build stage with CUDA development toolkit
+FROM nvidia/cuda:11.8.0-devel-ubuntu20.04 AS builder
 
 # Set environment variables to non-interactive
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 
-# Install system dependencies
+# Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
@@ -13,8 +13,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     liblapack-dev \
     libjpeg-dev \
     libpng-dev \
-    libx11-dev \
-    libgtk-3-dev \
     python3 \
     python3-pip \
     python3-dev \
@@ -24,16 +22,51 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Set python3 as default python
 RUN ln -s /usr/bin/python3 /usr/bin/python
 
+# Create and set the working directory for the build
+WORKDIR /app
+
+# Copy requirements to install dependencies
+COPY requirements.txt .
+
+# Set environment variable to tell dlib to build with CUDA support
+ENV DLIB_USE_CUDA=1
+ENV CMAKE_CUDA_COMPILER_LAUNCHER=1
+
+# Install dlib and other python dependencies
+# This will compile dlib with CUDA support since nvcc is in the -devel image
+# and the environment variable is set.
+RUN pip3 install --no-cache-dir dlib
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# ---
+
+# Stage 2: Final runtime stage
+FROM nvidia/cuda:11.8.0-runtime-ubuntu20.04
+
+# Set environment variables to non-interactive
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+
+# Install only necessary runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libopenblas-dev \
+    liblapack-dev \
+    libjpeg-dev \
+    libpng-dev \
+    libx11-dev \
+    libgtk-3-dev \
+    python3 \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set python3 as default python
+RUN ln -s /usr/bin/python3 /usr/bin/python
+
 # Create and set the working directory
 WORKDIR /app
 
-# Copy the requirements file into the container
-COPY requirements.txt .
-
-# Install Python dependencies
-# We install dlib first with flags to enable CUDA
-RUN pip3 install --no-cache-dir dlib --config-settings="--compiler-flags=-mavx" --config-settings="--no-use-pep517"
-RUN pip3 install --no-cache-dir -r requirements.txt
+# Copy the installed python packages from the builder stage
+COPY --from=builder /usr/local/lib/python3.8/dist-packages /usr/local/lib/python3.8/dist-packages
 
 # Copy the application source code into the container
 COPY ./facesorter ./facesorter
