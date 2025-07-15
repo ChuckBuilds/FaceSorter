@@ -133,6 +133,18 @@ def load_and_verify_image(file_path):
     except (IOError, SyntaxError, UnidentifiedImageError):
         return False
 
+def find_unique_name(directory, desired_name):
+    """
+    Finds a unique directory name to avoid collisions.
+    If 'desired_name' exists, it appends '_1', '_2', etc.
+    """
+    counter = 1
+    new_name = desired_name
+    while os.path.exists(os.path.join(directory, new_name)):
+        new_name = f"{desired_name}_{counter}"
+        counter += 1
+    return new_name
+
 # --- Main Application Logic ---
 def run_processing_pipeline(uploaded_files, eps_value, min_face_area, face_detector_model, max_workers, batch_size):
     """
@@ -815,7 +827,10 @@ def main():
                             person_data = st.session_state.people[person_id]
                             
                             old_dir = os.path.join(OUTPUT_DIR, old_name)
-                            new_dir = os.path.join(OUTPUT_DIR, new_name)
+                            
+                            # Find a unique name for the new directory
+                            unique_new_name = find_unique_name(OUTPUT_DIR, new_name)
+                            new_dir = os.path.join(OUTPUT_DIR, unique_new_name)
 
                             # Perform rename synchronously
                             if os.path.isdir(old_dir):
@@ -824,8 +839,8 @@ def main():
                             # Update all file paths to reflect the new directory
                             person_data['files'] = {os.path.join(new_dir, os.path.basename(f)) for f in person_data['files']}
                             
-                            # Update the name
-                            person_data['name'] = new_name
+                            # Update the name in the session state to the (potentially modified) unique name
+                            person_data['name'] = unique_new_name
 
 
                     # Then, perform deletions
