@@ -1,0 +1,16 @@
+# config.yaml
+hardware:
+  backend: "auto"  # cpu, gpu, tpu, auto
+  batch_size: 32
+  num_workers: 4
+
+processing:
+  face_detection_confidence: 0.8
+  clustering_threshold: 0.6
+  min_face_size: 20
+  max_faces_per_image: 10
+
+output:
+  folder_naming: "gender_number"  # gender_number, person_1, custom
+  copy_mode: true  # true for copy, false for move
+  create_preview: true 

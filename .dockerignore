@@ -1,0 +1,30 @@
+# Git
+.git
+.gitignore
+
+# Docker
+.dockerignore
+Dockerfile
+
+# Virtual environment
+venv
+.venv
+
+# Python cache
+__pycache__
+*.pyc
+
+# IDE
+.idea
+.vscode
+
+# Sorted media outputs
+sorted_output/
+*.zip
+
+# Temp files
+temp_uploads/
+
+# OS-specific
+.DS_Store
+Thumbs.db 
