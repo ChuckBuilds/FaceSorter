@@ -28,15 +28,16 @@ WORKDIR /app
 # Copy requirements to install dependencies
 COPY requirements.txt .
 
-# Set environment variable to tell dlib to build with CUDA support
+# Set environment variables to force a CUDA-enabled build of dlib
 ENV DLIB_USE_CUDA=1
-ENV CUDNN_VERSION=8
+ENV CMAKE_ARGS="-DDLIB_USE_CUDA=1 -DUSE_AVX_INSTRUCTIONS=1"
 
-# Force a from-source build of dlib to ensure GPU support is compiled in.
-# We also specify the CUDA compute capabilities for your specific GPU family (P2200 is Pascal architecture).
-RUN pip3 install --no-cache-dir --verbose --install-option="--yes" --install-option="DLIB_USE_CUDA" \
-    --install-option="--compute-version=6.1" dlib
-    
+# Force a from-source build of dlib and verify it was compiled with CUDA support.
+# This is the most reliable way to ensure the GPU is used.
+RUN pip3 install --no-cache-dir --force-reinstall --no-binary dlib dlib
+RUN python3 -c "import dlib; assert dlib.DLIB_USE_CUDA, 'dlib was NOT built with CUDA support'"
+
+# Now that dlib is correctly installed, install the rest of the requirements.
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 # ---
