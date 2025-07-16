@@ -175,8 +175,9 @@ def run_processing_pipeline(uploaded_files, eps_value, min_face_area, face_detec
 
         for uploaded_file in uploaded_files:
             temp_file_path = Path(TEMP_UPLOAD_DIR) / uploaded_file.name
+            # Stream the file to disk in chunks to avoid loading it all into RAM
             with open(temp_file_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
+                shutil.copyfileobj(uploaded_file, f)
             
             if temp_file_path.suffix.lower() in ['.mp4']:
                 st.info(f"Extracting frames from {temp_file_path.name}...")
