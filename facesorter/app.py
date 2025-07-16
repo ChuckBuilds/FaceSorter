@@ -146,7 +146,7 @@ def find_unique_name(directory, desired_name):
     return new_name
 
 # --- Main Application Logic ---
-def run_processing_pipeline(uploaded_files, eps_value, min_face_area, face_detector_model, max_workers, batch_size):
+def run_processing_pipeline(uploaded_files, eps_value, min_face_area, face_detector_model, max_workers):
     """
     Executes the full face detection, clustering, and sorting pipeline.
     """
@@ -471,15 +471,6 @@ def main():
             help="Number of parallel processes to use for face detection. More workers can be faster but will use more RAM. Reduce this if you experience crashes with many files."
         )
 
-        batch_size = st.sidebar.slider(
-            "Batch Size",
-            min_value=10,
-            max_value=500,
-            value=BATCH_SIZE,
-            step=10,
-            help="Number of files to process in a single batch. Smaller batches use less memory but may be slower overall. Reduce this if you encounter memory errors."
-        )
-
         show_debugger = st.sidebar.checkbox("Show Face Size Debugger")
 
         min_face_area = st.sidebar.number_input(
@@ -558,7 +549,7 @@ def main():
                 cleanup_directory(OUTPUT_DIR)
                 with st.spinner("Analyzing and sorting your photos..."):
                     people, num_clusters, merge_candidates, temp_file_paths = run_processing_pipeline(
-                        uploaded_files, eps_value, min_face_area, model_choice, max_workers, batch_size
+                        uploaded_files, eps_value, min_face_area, model_choice, max_workers
                     )
 
                     # Store results in session state to persist across reruns
