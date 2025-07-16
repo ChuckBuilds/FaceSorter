@@ -1,5 +1,5 @@
 # Stage 1: Build stage with CUDA development toolkit
-FROM nvidia/cuda:11.8.0-devel-ubuntu20.04 AS builder
+FROM nvidia/cuda:11.8.0-devel-cudnn8-ubuntu20.04 AS builder
 
 # Set environment variables to non-interactive
 ENV DEBIAN_FRONTEND=noninteractive
@@ -48,14 +48,12 @@ WORKDIR /app
 # Verify that dlib was compiled with CUDA support before proceeding.
 RUN python3 -c "import dlib; assert dlib.DLIB_USE_CUDA, 'dlib was NOT built with CUDA support'"
 
-# Install face-recognition without its dlib dependency.
-# Then, install the rest of the python packages
-RUN pip3 install --no-cache-dir -r requirements.in --no-deps
+# Now that dlib is correctly installed, install the rest of the requirements
 RUN pip3 install --no-cache-dir -r requirements.in
 # ---
 
 # Stage 2: Final runtime stage
-FROM nvidia/cuda:11.8.0-runtime-ubuntu20.04
+FROM nvidia/cuda:11.8.0-runtime-cudnn8-ubuntu20.04
 
 # Set environment variables to non-interactive
 ENV DEBIAN_FRONTEND=noninteractive
