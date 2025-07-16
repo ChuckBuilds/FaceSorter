@@ -26,7 +26,7 @@ RUN ln -s /usr/bin/python3 /usr/bin/python
 WORKDIR /app
 
 # Copy requirements to install dependencies
-COPY requirements.txt .
+COPY requirements.in .
 
 # Set environment variable to force a CUDA-enabled build of dlib
 ENV DLIB_USE_CUDA=1
@@ -45,9 +45,10 @@ RUN git clone https://github.com/davisking/dlib.git && \
 # Verify that dlib was compiled with CUDA support before proceeding.
 RUN python3 -c "import dlib; assert dlib.DLIB_USE_CUDA, 'dlib was NOT built with CUDA support'"
 
-# Now that dlib is correctly installed, install the rest of the requirements
-RUN pip3 install --no-cache-dir -r requirements.txt
-
+# Install face-recognition without its dlib dependency.
+# Then, install the rest of the python packages
+RUN pip3 install --no-cache-dir --no-dependencies face-recognition && \
+    pip3 install --no-cache-dir -r requirements.in
 # ---
 
 # Stage 2: Final runtime stage
