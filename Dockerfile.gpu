@@ -30,12 +30,13 @@ COPY requirements.txt .
 
 # Set environment variable to tell dlib to build with CUDA support
 ENV DLIB_USE_CUDA=1
-ENV CMAKE_CUDA_COMPILER_LAUNCHER=1
+ENV CUDNN_VERSION=8
 
-# Install dlib and other python dependencies
-# This will compile dlib with CUDA support since nvcc is in the -devel image
-# and the environment variable is set.
-RUN pip3 install --no-cache-dir dlib
+# Force a from-source build of dlib to ensure GPU support is compiled in.
+# We also specify the CUDA compute capabilities for your specific GPU family (P2200 is Pascal architecture).
+RUN pip3 install --no-cache-dir --verbose --install-option="--yes" --install-option="DLIB_USE_CUDA" \
+    --install-option="--compute-version=6.1" dlib
+    
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 # ---
