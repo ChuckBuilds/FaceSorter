@@ -14,6 +14,11 @@ import cv2
 import threading
 from queue import Queue, Empty
 import atexit
+import time # Added for retry logic
+
+# Define a reasonable upper limit for max_workers to prevent system overload.
+# This can be adjusted, but it's a safeguard against excessive process spawning.
+MAX_WORKERS_LIMIT = os.cpu_count() or 4  # Default to 4 if cpu_count() is None
 
 # Set LOKY_MAX_CPU_COUNT to avoid issues on Windows with wmic
 if os.name == 'nt': # Check if the OS is Windows
@@ -106,9 +111,32 @@ def _process_encoding_worker(args):
     return None
 
 def cleanup_directory(dir_path):
-    """Removes a directory and all its contents if it exists."""
-    if os.path.exists(dir_path):
-        shutil.rmtree(dir_path)
+    """
+    Removes a directory and all its contents if it exists.
+    Retries a few times on Windows to handle "Device or resource busy" errors.
+    """
+    if not os.path.exists(dir_path):
+        return
+    
+    # Retry logic for shutil.rmtree, especially for Windows OS
+    max_retries = 5
+    delay = 1  # seconds
+    for attempt in range(max_retries):
+        try:
+            shutil.rmtree(dir_path)
+            return
+        except OSError as e:
+            # On Windows, rmtree can fail with "Device or resource busy"
+            # if a file handle is briefly held open.
+            if os.name == 'nt' and e.errno == 16: # errno 16 is "Device or resource busy"
+                time.sleep(delay)
+                continue
+            # Re-raise exceptions that are not the one we're handling
+            raise
+    
+    # If it still fails after retries, raise the last exception
+    st.error(f"Failed to cleanup directory {dir_path} after {max_retries} attempts.")
+
 
 def create_zip_archive(src_dir, zip_filepath):
     """Creates a zip archive from a source directory."""
@@ -151,6 +179,12 @@ def run_processing_pipeline(uploaded_files, eps_value, min_face_area, face_detec
     Executes the full face detection, clustering, and sorting pipeline.
     """
     try:
+        # --- Safeguard ---
+        # Clamp the number of workers to the defined limit to avoid crashing the system.
+        if max_workers > MAX_WORKERS_LIMIT:
+            st.warning(f"Limiting concurrent processes to {MAX_WORKERS_LIMIT} (system CPU count) to prevent system instability.")
+            max_workers = MAX_WORKERS_LIMIT
+
         # --- INITIALIZATION ---
         cleanup_directory(TEMP_UPLOAD_DIR)
         cleanup_directory(TEMP_CROP_DIR)
