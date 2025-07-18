@@ -1,6 +1,6 @@
 # FaceSorter
 
-FaceSorter is an intelligent application that automatically organizes wedding photos and videos by detecting and clustering faces, then distributing media files to appropriate folders for easy sharing with guests.
+FaceSorter is an application that automatically organizes photos and videos by detecting and clustering faces, then distributing media files to appropriate folders for easy sharing with guests.
 
 ## Prerequisites (for Windows)
 
