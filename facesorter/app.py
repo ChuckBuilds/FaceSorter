@@ -162,6 +162,61 @@ def show_face_crops(faces, columns=8, limit=None):
         st.caption(f"...and {len(faces) - limit} more")
 
 
+# --- Folder browser (server-side; the browser can't hand us local paths) ---
+
+def _browse_to(path):
+    st.session_state.browse_dir = str(path)
+
+
+def _use_browse_dir():
+    st.session_state.folder_input = st.session_state.browse_dir
+
+
+def render_folder_browser():
+    """Clickable folder navigation that fills the folder-path box."""
+    browse_dir = Path(st.session_state.get("browse_dir", Path.home()))
+    if not browse_dir.is_dir():
+        browse_dir = Path.home()
+        st.session_state.browse_dir = str(browse_dir)
+
+    with st.container(border=True):
+        up_col, home_col, path_col = st.columns([0.08, 0.08, 0.84])
+        up_col.button("⬆️", help="Up one level", on_click=_browse_to,
+                      args=(browse_dir.parent,),
+                      disabled=browse_dir.parent == browse_dir)
+        home_col.button("🏠", help="Go to your home folder",
+                        on_click=_browse_to, args=(Path.home(),))
+        path_col.code(str(browse_dir), language=None)
+
+        try:
+            entries = list(browse_dir.iterdir())
+        except PermissionError:
+            st.warning("Permission denied for this folder.")
+            entries = []
+        subdirs = sorted(
+            (p for p in entries if p.is_dir() and not p.name.startswith('.')),
+            key=lambda p: p.name.lower())
+        image_count = sum(
+            1 for p in entries if p.is_file()
+            and p.suffix.lower() in MediaProcessor.SUPPORTED_IMAGE_FORMATS)
+
+        st.button(f"✅ Use this folder ({image_count} images here, "
+                  "subfolders included at scan)",
+                  on_click=_use_browse_dir, use_container_width=True)
+
+        max_shown = 32
+        if subdirs:
+            cols = st.columns(4)
+            for i, sub in enumerate(subdirs[:max_shown]):
+                cols[i % 4].button(
+                    f"📁 {sub.name}", key=f"browse_{sub}",
+                    on_click=_browse_to, args=(sub,),
+                    use_container_width=True)
+            if len(subdirs) > max_shown:
+                st.caption(f"...and {len(subdirs) - max_shown} more subfolders "
+                           "(type the path above to jump directly)")
+
+
 # --- Main app sections ---
 
 def render_input_section(det_size):
@@ -169,9 +224,13 @@ def render_input_section(det_size):
     folder_tab, upload_tab = st.tabs(["📁 Local folder", "⬆️ Upload files"])
 
     with folder_tab:
+        if st.toggle("📂 Browse for a folder",
+                     help="Navigate your folders by clicking instead of "
+                          "typing a path."):
+            render_folder_browser()
         folder = st.text_input(
             "Folder path",
-            value=st.session_state.get("last_folder", ""),
+            key="folder_input",
             placeholder="/path/to/unsorted_photos",
             help="Scanned recursively for images. Nothing is moved or "
                  "modified — sorted copies are made at export time.",
@@ -182,7 +241,6 @@ def render_input_section(det_size):
             except FileNotFoundError:
                 st.error(f"Folder not found: {folder}")
                 return
-            st.session_state.last_folder = folder
             run_scan(paths, det_size, folder)
 
     with upload_tab:

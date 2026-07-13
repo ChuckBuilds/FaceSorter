@@ -28,7 +28,7 @@ source venv/bin/activate        # if not already active
 streamlit run facesorter/app.py
 ```
 
-1. **Choose photos** — point it at a local folder (scanned recursively; nothing in it is modified) or drag-and-drop uploads.
+1. **Choose photos** — point it at a local folder (scanned recursively; nothing in it is modified) by typing a path or using the built-in **📂 Browse for a folder** toggle to click through your folders, or drag-and-drop uploads.
 2. **Scan** — every face is detected and fingerprinted once, then cached on disk (`~/.facesorter/scan_cache.db`). Re-scanning the same folder is nearly instant and only processes new or changed files.
 3. **Review groups** — faces are grouped into people. Rename groups, apply suggested merges, remove groups you don't want. All the tuning sliders re-group instantly without re-scanning.
 4. **Export** — copies of the originals are written to `<output>/<person>/`, with an optional ZIP.
