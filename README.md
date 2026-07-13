@@ -4,21 +4,27 @@ FaceSorter sorts a folder of unsorted photos into a folder per person, based on 
 
 Face detection and recognition run locally via [InsightFace](https://github.com/deepinsight/insightface) (SCRFD detector + ArcFace embeddings) on CPU — no GPU, CUDA, or compiler toolchain required.
 
-## Installation
+## Quick start
+
+Requires Python 3.10+ (tested on 3.12 and 3.14). No compiler, CMake, or GPU needed.
 
 ```bash
+git clone https://github.com/ChuckBuilds/FaceSorter
+cd FaceSorter
 python -m venv venv
 source venv/bin/activate        # Windows: .\venv\Scripts\Activate.ps1
 pip install -r requirements.in
+streamlit run facesorter/app.py
 ```
 
-On first run, InsightFace downloads its models (~300 MB) to `~/.insightface`.
+The app opens at <http://localhost:8501>. On the very first scan, InsightFace downloads its models (~300 MB, one time) to `~/.insightface` — expect a short delay before the progress bar starts moving.
 
 ## Usage
 
 ### Web app
 
 ```bash
+source venv/bin/activate        # if not already active
 streamlit run facesorter/app.py
 ```
 
@@ -30,6 +36,7 @@ streamlit run facesorter/app.py
 ### Command line
 
 ```bash
+source venv/bin/activate        # if not already active
 python -m facesorter.cli --source /path/to/photos --output sorted_output
 ```
 
@@ -39,8 +46,15 @@ Run `python -m facesorter.cli --help` for all tuning flags (`--eps`, `--min-conf
 
 ```bash
 docker build -t facesorter .
-docker run -p 8501:8501 -v ~/Pictures:/photos facesorter
+docker run -p 8501:8501 \
+  -v ~/Pictures:/photos:ro \
+  -v ~/facesorter-output:/output \
+  -v facesorter-models:/root/.insightface \
+  -v facesorter-data:/root/.facesorter \
+  facesorter
 ```
+
+Then open <http://localhost:8501>, use `/photos` (or any subfolder) as the folder path, and set the output folder to `/output` when exporting. The named volumes persist the downloaded models and the scan cache across container restarts.
 
 ## Understanding the settings
 
