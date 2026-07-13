@@ -1,288 +1,158 @@
-import face_recognition
-from PIL import Image, ImageDraw, ImageFont
+import hashlib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import cv2
 import numpy as np
+from PIL import Image, ImageOps
+
+# Detection threshold used at scan time. Kept intentionally low so the cache
+# stores every plausible face; the UI's confidence slider filters after the
+# fact without invalidating cached scans.
+SCAN_DET_THRESH = 0.30
+
+
+@dataclass
+class DetectedFace:
+    """A single face found in an image."""
+    source_path: str          # original media file the face came from
+    bbox: np.ndarray          # (4,) float32: x1, y1, x2, y2 in original image coords
+    score: float              # detector confidence, 0-1
+    embedding: np.ndarray     # (512,) float32, L2-normalized ArcFace embedding
+    crop_path: str = field(default="")  # thumbnail of the face, for the UI
+
+    @property
+    def height(self):
+        return float(self.bbox[3] - self.bbox[1])
+
 
 class FaceDetector:
     """
-    Handles face detection and facial feature extraction from images.
+    Face detection + embedding via InsightFace (SCRFD detector, ArcFace
+    recognition). Models are downloaded to ~/.insightface on first use.
     """
 
-    def __init__(self, model="hog"):
+    def __init__(self, det_size=640, crop_dir=None):
         """
-        Initializes the FaceDetector.
-
         Args:
-            model (str): The face detection model to use. Can be "hog" (less accurate, faster on CPU)
-                         or "cnn" (more accurate, needs GPU/CUDA for speed).
+            det_size (int): Detector input resolution. Higher finds smaller
+                            faces but is slower (640 is a good default).
+            crop_dir (str or Path, optional): Directory to save face thumbnail
+                            crops into. Crops are skipped if omitted.
         """
-        self.model = model
+        from insightface.app import FaceAnalysis  # deferred: slow import
 
-    def detect_faces(self, image_path, min_face_area=None):
-        """
-        Detects faces in a single image, filters by area, and returns encodings, locations, and debug info.
-        
-        Args:
-            image_path (str or Path): The path to the image file.
-            min_face_area (int, optional): Minimum area for a detected face to be considered valid.
-        Returns:
-            A tuple containing:
-            - image (np.array): The loaded image data.
-            - face_encodings (list): A list of 128-dimensional encodings for each valid face.
-            - face_locations (list): A list of bounding box coordinates for each valid face.
-            - debug_info (list): A list of (location, area) tuples for ALL faces detected.
-        """
-        try:
-            # Load the original image once
-            original_image = face_recognition.load_image_file(image_path)
-            
-            # For both models, resize the image to be faster if it's large.
-            # This reduces the amount of data to scan for faces.
-            pil_image = Image.fromarray(original_image)
-            max_size = 2048  
-            if pil_image.height > max_size or pil_image.width > max_size:
-                pil_image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-            
-            image_to_process = np.array(pil_image)
-            
-            # --- Performance Optimization ---
-            # 1. Detect faces on the smaller, processed image.
-            locations_on_processed = face_recognition.face_locations(image_to_process, model=self.model)
+        self.det_size = int(det_size)
+        self.crop_dir = Path(crop_dir) if crop_dir else None
+        if self.crop_dir:
+            self.crop_dir.mkdir(parents=True, exist_ok=True)
 
-            # 2. Scale locations up to the original image size for accurate area filtering and cropping.
-            locations_on_original = locations_on_processed
-            if image_to_process.shape != original_image.shape:
-                h_orig, w_orig, _ = original_image.shape
-                h_proc, w_proc, _ = image_to_process.shape
-                w_scale = w_orig / w_proc
-                h_scale = h_orig / h_proc
-                locations_on_original = [
-                    (int(top * h_scale), int(right * w_scale), int(bottom * h_scale), int(left * w_scale))
-                    for (top, right, bottom, left) in locations_on_processed
-                ]
-
-            # 3. Filter faces based on area, using the original scale for intuitive thresholds.
-            debug_info = [(loc, (loc[1] - loc[3]) * (loc[2] - loc[0])) for loc in locations_on_original]
-
-            valid_indices = list(range(len(locations_on_original)))
-            if min_face_area:
-                valid_indices = [i for i, (loc, area) in enumerate(debug_info) if area >= min_face_area]
-
-            valid_locations_on_original = [locations_on_original[i] for i in valid_indices]
-            
-            # 4. Get encodings using the smaller `image_to_process` for a massive speedup.
-            face_encodings = []
-            if valid_indices:
-                valid_locations_on_processed = [locations_on_processed[i] for i in valid_indices]
-                face_encodings = face_recognition.face_encodings(image_to_process, known_face_locations=valid_locations_on_processed)
-
-            # 5. Return the final data.
-            return original_image, face_encodings, valid_locations_on_original, debug_info
-                
-        except Exception as e:
-            # logger.error(f"Could not process image {image_path}: {e}")
-            return None, [], [], []
-
-    def get_face_encodings(self, image, face_locations):
-        """
-        Gets the 128-dimension face encoding for each face in the image.
-
-        Args:
-            image (np.array): The image data from load_image_file.
-            face_locations (list): The list of face bounding boxes from face_locations.
-
-        Returns:
-            A list of face encodings (128-dimensional vectors).
-        """
-        face_encodings = face_recognition.face_encodings(image, face_locations)
-        return face_encodings
+        self.app = FaceAnalysis(
+            name="buffalo_l",
+            allowed_modules=["detection", "recognition"],
+            providers=["CPUExecutionProvider"],
+        )
+        self.app.prepare(ctx_id=-1, det_size=(self.det_size, self.det_size),
+                         det_thresh=SCAN_DET_THRESH)
 
     @staticmethod
-    def draw_face_tags(image, face_locations_with_areas):
+    def load_image_bgr(image_path):
         """
-        Draws bounding boxes and numbers for each face to help with debugging.
+        Loads an image as a BGR numpy array, honoring EXIF orientation
+        (phone photos are often stored rotated). Returns None on failure.
+        """
+        try:
+            with Image.open(image_path) as img:
+                img = ImageOps.exif_transpose(img)
+                rgb = np.asarray(img.convert("RGB"))
+            return rgb[:, :, ::-1].copy()  # RGB -> BGR for OpenCV/InsightFace
+        except Exception:
+            return None
 
-        Args:
-            image (np.array): The image data.
-            face_locations_with_areas (list): A list of (location, area) tuples from detect_faces.
+    def detect_faces(self, image_path):
+        """
+        Detects and embeds every face in an image.
 
         Returns:
-            A PIL Image object with tagged faces.
+            list[DetectedFace], or None if the image could not be read.
         """
-        pil_image = Image.fromarray(image)
-        draw = ImageDraw.Draw(pil_image)
-        try:
-            # Use a default font. A specific .ttf file could be provided for better results.
-            font = ImageFont.load_default()
-        except IOError:
-            font = None
+        bgr = self.load_image_bgr(image_path)
+        if bgr is None:
+            return None
+        faces = self.app.get(bgr)
 
-        for i, (loc, area) in enumerate(face_locations_with_areas):
-            top, right, bottom, left = loc
-            # Draw rectangle
-            draw.rectangle(((left, top), (right, bottom)), outline=(0, 255, 0), width=3)
-            
-            # Prepare text and background
-            text = f"Face {i+1}"
-            
-            # Draw a filled rectangle as a background for the text for better visibility
-            if font:
-                # Pillow 9.2.0+ uses textbbox for more accurate size calculation
-                try:
-                    text_bbox = draw.textbbox((left, top), text, font=font)
-                    text_width = text_bbox[2] - text_bbox[0]
-                    text_height = text_bbox[3] - text_bbox[1]
-                    bg_y0 = top - text_height - 10
-                    # Adjust so text is above the box, not overlapping
-                    if bg_y0 < 0:
-                        bg_y0 = bottom + 10
-                    
-                    draw.rectangle(((left, bg_y0), (left + text_width + 8, bg_y0 + text_height + 4)), fill=(0, 255, 0))
-                    draw.text((left + 4, bg_y0 + 2), text, fill=(0, 0, 0), font=font)
-                except AttributeError:
-                    # Fallback for older Pillow versions
-                    text_width, text_height = draw.textsize(text, font=font)
-                    bg_y0 = top - text_height - 10
-                    if bg_y0 < 0:
-                        bg_y0 = bottom + 10
-                    draw.rectangle(((left, bg_y0), (left + text_width + 8, bg_y0 + text_height + 4)), fill=(0, 255, 0))
-                    draw.text((left + 4, bg_y0 + 2), text, fill=(0, 0, 0), font=font)
-            else:
-                 # Fallback if no font is available
-                 draw.text((left + 4, top - 15), text, fill=(0, 255, 0))
+        results = []
+        for face in faces:
+            detected = DetectedFace(
+                source_path=str(image_path),
+                bbox=face.bbox.astype(np.float32),
+                score=float(face.det_score),
+                embedding=face.normed_embedding.astype(np.float32),
+            )
+            if self.crop_dir is not None:
+                detected.crop_path = self._save_crop(bgr, detected)
+            results.append(detected)
+        return results
 
-        return pil_image
+    def _save_crop(self, bgr, face, padding_frac=0.25, thumb_size=160):
+        """Saves a padded thumbnail crop of the face; returns its path."""
+        crop_path = self.crop_dir / f"{crop_key(face)}.jpg"
+        if crop_path.exists():
+            return str(crop_path)
 
-    @staticmethod
-    def draw_diagnostic_tags(image, face_info_list, min_area_threshold):
-        """
-        Draws bounding boxes and detailed diagnostic info for each face.
+        h, w = bgr.shape[:2]
+        x1, y1, x2, y2 = face.bbox
+        pad = padding_frac * max(x2 - x1, y2 - y1)
+        x1 = max(0, int(x1 - pad))
+        y1 = max(0, int(y1 - pad))
+        x2 = min(w, int(x2 + pad))
+        y2 = min(h, int(y2 + pad))
+        if x2 <= x1 or y2 <= y1:
+            return ""
 
-        Args:
-            image (np.array): The image data.
-            face_info_list (list): A list of (location, area) tuples from detect_faces debug_info.
-            min_area_threshold (int): The minimum area to highlight which faces are kept.
+        crop = bgr[y1:y2, x1:x2]
+        scale = thumb_size / max(crop.shape[:2])
+        if scale < 1:
+            crop = cv2.resize(crop, (max(1, int(crop.shape[1] * scale)),
+                                     max(1, int(crop.shape[0] * scale))))
+        cv2.imwrite(str(crop_path), crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        return str(crop_path)
 
-        Returns:
-            A PIL Image object with tagged faces.
-        """
-        pil_image = Image.fromarray(image)
-        draw = ImageDraw.Draw(pil_image)
-        try:
-            # Use a default font. A specific .ttf file could be provided for better results.
-            font = ImageFont.load_default(60)
-        except IOError:
-            font = None
 
-        for i, (loc, area) in enumerate(face_info_list):
-            top, right, bottom, left = loc
-            
-            is_valid = area >= min_area_threshold
-            box_color = (0, 255, 0) if is_valid else (255, 0, 0) # Green for valid, Red for invalid
-            
-            # Draw rectangle
-            draw.rectangle(((left, top), (right, bottom)), outline=box_color, width=5)
-            
-            # Prepare text and background
-            text = f"Face {i+1}\nArea: {int(area)}"
-            
-            # Draw a filled rectangle as a background for the text for better visibility
-            if font:
-                # Pillow 9.2.0+ uses textbbox for more accurate size calculation
-                try:
-                    text_bbox = draw.textbbox((left, top), text, font=font)
-                    text_width = text_bbox[2] - text_bbox[0]
-                    text_height = text_bbox[3] - text_bbox[1]
-                    bg_y0 = top - text_height - 10
-                    # Adjust so text is above the box, not overlapping
-                    if bg_y0 < 0:
-                        bg_y0 = bottom + 10
-                    
-                    draw.rectangle(((left, bg_y0), (left + text_width + 8, bg_y0 + text_height + 4)), fill=box_color)
-                    draw.text((left + 4, bg_y0 + 2), text, fill=(0, 0, 0), font=font)
-                except AttributeError:
-                    # Fallback for older Pillow versions
-                    text_width, text_height = draw.textsize(text, font=font)
-                    bg_y0 = top - text_height - 10
-                    if bg_y0 < 0:
-                        bg_y0 = bottom + 10
-                    draw.rectangle(((left, bg_y0), (left + text_width + 8, bg_y0 + text_height + 4)), fill=box_color)
-                    draw.text((left + 4, bg_y0 + 2), text, fill=(0, 0, 0), font=font)
-            else:
-                 # Fallback if no font is available
-                 draw.text((left + 4, top - 15), text, fill=box_color)
+def crop_key(face):
+    """Stable id for a face's thumbnail, derived from its source and bbox."""
+    return hashlib.sha1(
+        f"{face.source_path}|{face.bbox.round(1).tolist()}".encode()
+    ).hexdigest()
 
-        return pil_image
 
-    @staticmethod
-    def draw_faces(image, face_locations):
-        """
-        Draws bounding boxes around the detected faces.
+def filter_faces(faces, min_score=0.5, min_height=40):
+    """
+    Applies the UI's post-detection filters to a list of DetectedFace.
+    Kept separate from detection so changing filters never re-scans.
+    """
+    return [f for f in faces if f.score >= min_score and f.height >= min_height]
 
-        Args:
-            image (np.array): The image data.
-            face_locations (list): A list of face bounding box coordinates.
 
-        Returns:
-            A PIL Image object with rectangles drawn around the faces.
-        """
-        pil_image = Image.fromarray(image)
-        draw = ImageDraw.Draw(pil_image)
-
-        for (top, right, bottom, left) in face_locations:
-            draw.rectangle(((left, top), (right, bottom)), outline=(0, 255, 0), width=3)
-
-        return pil_image
-
-    @staticmethod
-    def crop_faces(image, face_locations, padding=30):
-        """
-        Crops faces from an image using the bounding box coordinates.
-
-        Args:
-            image (np.array): The image data.
-            face_locations (list): A list of face bounding box coordinates.
-            padding (int): The number of pixels to add around the detected face box.
-
-        Returns:
-            A list of PIL Image objects, each being a cropped face.
-        """
-        pil_image = Image.fromarray(image)
-        face_crops = []
-        img_height, img_width, _ = image.shape
-
-        for (top, right, bottom, left) in face_locations:
-            # Add padding and ensure coordinates are within image bounds
-            top = max(0, top - padding)
-            left = max(0, left - padding)
-            right = min(img_width, right + padding)
-            bottom = min(img_height, bottom + padding)
-            
-            # Crop the face from the image
-            face_image = pil_image.crop((left, top, right, bottom))
-            face_crops.append(face_image)
-
-        return face_crops 
-
-    def get_face_locations(self, image_path, model="hog"):
-        """Returns the locations of faces in an image."""
-        try:
-            image = face_recognition.load_image_file(image_path)
-            return face_recognition.face_locations(image, model=model)
-        except Exception as e:
-            # logger.error(f"Could not get face locations from {image_path}: {e}")
-            return []
-
-    def extract_face_crops(self, image_path, face_locations):
-        """Extracts and returns image crops for each detected face."""
-        if not face_locations:
-            return []
-            
-        try:
-            image = face_recognition.load_image_file(image_path)
-            face_crops = []
-            for top, right, bottom, left in face_locations:
-                face_crops.append(image[top:bottom, left:right])
-            return face_crops
-        except Exception as e:
-            # logger.error(f"Could not extract face crops from {image_path}: {e}")
-            return []
+def draw_diagnostic_boxes(bgr, faces, min_score, min_height):
+    """
+    Draws labeled boxes on a copy of the image for the diagnostic tool.
+    Green = passes the current filters, red = detected but filtered out.
+    Returns an RGB numpy array for display.
+    """
+    canvas = bgr.copy()
+    thickness = max(2, canvas.shape[1] // 640)
+    font_scale = max(0.5, canvas.shape[1] / 1600)
+    for i, face in enumerate(faces):
+        ok = face.score >= min_score and face.height >= min_height
+        color = (0, 200, 0) if ok else (0, 0, 230)
+        x1, y1, x2, y2 = face.bbox.astype(int)
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), color, thickness)
+        label = f"#{i + 1} conf {face.score:.2f} h {int(face.height)}px"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
+                                      font_scale, thickness)
+        ty = y1 - 8 if y1 - th - 12 > 0 else y2 + th + 8
+        cv2.rectangle(canvas, (x1, ty - th - 6), (x1 + tw + 6, ty + 4), color, -1)
+        cv2.putText(canvas, label, (x1 + 3, ty), cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale, (255, 255, 255), thickness)
+    return canvas[:, :, ::-1]
