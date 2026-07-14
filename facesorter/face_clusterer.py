@@ -1,5 +1,3 @@
-from itertools import combinations
-
 import numpy as np
 from sklearn.cluster import DBSCAN
 
@@ -45,31 +43,3 @@ class FaceClusterer:
         ).fit(encodings_array).labels_
         num_clusters = len(set(labels) - {UNSORTED_LABEL})
         return labels, num_clusters
-
-    @staticmethod
-    def get_cluster_centroids(encodings, labels):
-        """
-        Returns {cluster_id: centroid} with re-normalized mean embeddings.
-        The noise bucket is excluded.
-        """
-        encodings = np.asarray(encodings)
-        centroids = {}
-        for label in set(labels) - {UNSORTED_LABEL}:
-            mean = encodings[labels == label].mean(axis=0)
-            norm = np.linalg.norm(mean)
-            centroids[label] = mean / norm if norm > 0 else mean
-        return centroids
-
-    @staticmethod
-    def find_merge_candidates(centroids, threshold=0.6):
-        """
-        Returns pairs of cluster ids whose centroids are within `threshold`
-        cosine distance — likely the same person split by a strict eps.
-        """
-        candidates = []
-        for id1, id2 in combinations(sorted(centroids.keys()), 2):
-            # cosine distance between unit vectors
-            distance = 1.0 - float(np.dot(centroids[id1], centroids[id2]))
-            if distance < threshold:
-                candidates.append((id1, id2))
-        return candidates

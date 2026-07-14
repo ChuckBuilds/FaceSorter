@@ -8,6 +8,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 APP_DATA_DIR = Path(os.environ.get("FACESORTER_DATA_DIR",
                                    Path.home() / ".facesorter"))
 SCAN_CACHE_DB = APP_DATA_DIR / "scan_cache.db"
+PEOPLE_DB = APP_DATA_DIR / "people.db"
 CROP_DIR = APP_DATA_DIR / "crops"
 TEMP_UPLOAD_DIR = APP_DATA_DIR / "uploads"
 OUTPUT_DIR = str(REPO_ROOT / "sorted_output")

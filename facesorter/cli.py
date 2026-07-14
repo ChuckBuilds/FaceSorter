@@ -3,12 +3,13 @@ import sys
 
 import numpy as np
 
-from facesorter.config import config, CROP_DIR, SCAN_CACHE_DB
+from facesorter.config import config, CROP_DIR, PEOPLE_DB, SCAN_CACHE_DB
 from facesorter.face_clusterer import FaceClusterer
 from facesorter.face_detector import FaceDetector, filter_faces
 from facesorter.file_organizer import FileOrganizer
 from facesorter.media_processor import MediaProcessor
-from facesorter.pipeline import group_faces, scan_files
+from facesorter.people_db import PeopleDB
+from facesorter.pipeline import group_faces, match_known_people, scan_files
 from facesorter.scan_cache import ScanCache
 
 
@@ -38,6 +39,13 @@ def main():
     parser.add_argument("--min-samples", type=int,
                         default=config.get("clustering.min_samples", 2),
                         help="Minimum faces to form a group.")
+    parser.add_argument("--match-distance", type=float,
+                        default=config.get("clustering.match_distance", 0.45),
+                        help="Max distance to auto-recognize a saved person "
+                             "from the people database.")
+    parser.add_argument("--ignore-people", action="store_true",
+                        help="Skip matching against saved people; cluster "
+                             "everything fresh.")
     parser.add_argument("--no-cache", action="store_true",
                         help="Ignore the scan cache and re-detect everything.")
     args = parser.parse_args()
@@ -74,11 +82,27 @@ def main():
         sys.exit("No faces passed the filters — try lowering "
                  "--min-confidence or --min-face-height.")
 
-    embeddings = np.stack([f.embedding for f in faces])
+    known_matches, remaining = {}, faces
+    people_names = {}
+    if not args.ignore_people:
+        people_centroids = PeopleDB(PEOPLE_DB).centroids()
+        known_matches, remaining = match_known_people(
+            faces, people_centroids, args.match_distance)
+        people_names = {pid: nc[0] for pid, nc in people_centroids.items()}
+        if known_matches:
+            matched_count = sum(len(v) for v in known_matches.values())
+            print(f"  {matched_count} faces recognized as "
+                  f"{len(known_matches)} saved people")
+
+    if remaining:
+        embeddings = np.stack([f.embedding for f in remaining])
+    else:
+        embeddings = []
     labels, num_clusters = FaceClusterer(
         eps=args.eps, min_samples=args.min_samples).cluster_faces(embeddings)
-    groups, unsorted_faces = group_faces(faces, labels)
-    print(f"  {len(faces)} faces -> {num_clusters} people "
+    groups, unsorted_faces = group_faces(remaining, labels,
+                                         known_matches, people_names)
+    print(f"  {len(faces)} faces -> {len(groups)} people "
           f"({len(unsorted_faces)} unsorted faces)")
 
     copied = FileOrganizer(args.output).export(groups)

@@ -7,6 +7,7 @@ detection:
 clustering:
   eps: 0.5               # max cosine distance to link two faces (lower = stricter)
   min_samples: 2         # min faces to form a group; singletons go to Unsorted
+  match_distance: 0.45   # max distance to auto-recognize a saved person
 
 output:
   dir: sorted_output     # default export folder (relative to the app)
