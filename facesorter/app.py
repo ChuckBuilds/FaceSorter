@@ -1,142 +1,55 @@
-import streamlit as st
+import hashlib
 import os
 import shutil
+import sqlite3
 import zipfile
-from pathlib import Path
-from PIL import Image, UnidentifiedImageError
-import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import face_recognition
-import warnings
-import gc
 from collections import defaultdict
-import cv2
-import threading
-from queue import Queue, Empty
-import atexit
-import time # Added for retry logic
+from itertools import combinations
+from pathlib import Path
 
-# Define a reasonable upper limit for max_workers to prevent system overload.
-# This can be adjusted, but it's a safeguard against excessive process spawning.
-MAX_WORKERS_LIMIT = os.cpu_count() or 4  # Default to 4 if cpu_count() is None
+import numpy as np
+import streamlit as st
 
-# Set LOKY_MAX_CPU_COUNT to avoid issues on Windows with wmic
-if os.name == 'nt': # Check if the OS is Windows
-    cpu_count = os.cpu_count()
-    if cpu_count is not None:
-        os.environ['LOKY_MAX_CPU_COUNT'] = str(cpu_count)
-
-# Suppress the specific UserWarning from face_recognition_models
-warnings.filterwarnings("ignore", category=UserWarning, message="pkg_resources is deprecated as an API")
-
-# Make sure all custom modules are in the python path
+# Make sure the package root is importable when run via `streamlit run`
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from facesorter.config import OUTPUT_DIR, TEMP_UPLOAD_DIR, TEMP_CROP_DIR, BATCH_SIZE
-from facesorter.face_detector import FaceDetector
+from facesorter.config import (config, CROP_DIR, OUTPUT_DIR, PEOPLE_DB,
+                               SCAN_CACHE_DB, TEMP_UPLOAD_DIR)
 from facesorter.face_clusterer import FaceClusterer
+from facesorter.face_detector import (FaceDetector, crop_key,
+                                      draw_diagnostic_boxes, filter_faces)
 from facesorter.file_organizer import FileOrganizer
 from facesorter.media_processor import MediaProcessor
-from facesorter.worker import init_worker, _process_image_worker
+from facesorter.people_db import PeopleDB
+from facesorter.pipeline import (group_faces, make_group, match_known_people,
+                                 scan_files, suggest_rescues)
+from facesorter.scan_cache import ScanCache
 
-# --- Background File Operations ---
-def file_op_worker(q):
-    """Worker to process file operations from a queue in the background."""
-    while True:
-        try:
-            op, args = q.get(block=True)
-            
-            if op == 'remove_file':
-                file_path, = args
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-            
-            elif op == 'rename_file':
-                old_path, new_path = args
-                if os.path.exists(old_path):
-                    shutil.move(old_path, new_path)
+# How much farther than eps an unsorted face may sit from a group's centroid
+# and still be offered as a "might also be this person" suggestion.
+RESCUE_MARGIN = 0.15
 
-            elif op == 'move_files_and_remove_dir':
-                src_dir, dest_dir = args
-                if os.path.isdir(src_dir) and os.path.isdir(dest_dir):
-                    for filename in os.listdir(src_dir):
-                        shutil.move(os.path.join(src_dir, filename), os.path.join(dest_dir, filename))
-                    os.rmdir(src_dir)
 
-            elif op == 'rename_dir':
-                old_path, new_path = args
-                if os.path.isdir(old_path):
-                    os.rename(old_path, new_path)
-            
-            elif op == 'remove_dir':
-                dir_path, = args
-                cleanup_directory(dir_path)
+# --- Cached resources (survive Streamlit reruns) ---
 
-            q.task_done()
-        except Empty:
-            continue # Should not happen with block=True, but good practice
-        except Exception as e:
-            # Log error to console for debugging
-            print(f"Background file operation error: {e}")
+@st.cache_resource
+def get_detector(det_size):
+    """The InsightFace model load takes a few seconds; do it once."""
+    return FaceDetector(det_size=det_size, crop_dir=CROP_DIR)
 
-def start_file_worker():
-    """Starts the file worker thread if it's not already running."""
-    if 'file_worker_thread_running' not in st.session_state or not st.session_state.file_worker_thread_running:
-        q = st.session_state.file_op_queue
-        thread = threading.Thread(target=file_op_worker, args=(q,), daemon=True)
-        thread.start()
-        st.session_state.file_worker_thread_running = True
 
-# --- Constants and Configuration ---
-# BATCH_SIZE is now imported from config
+@st.cache_resource
+def get_scan_cache():
+    return ScanCache(SCAN_CACHE_DB)
 
-# --- Helper Functions ---
 
-def _process_encoding_worker(args):
-    """
-    Helper for multiprocessing. Encodes and crops faces for a single image,
-    using pre-detected face locations.
-    """
-    image_path, face_locations = args
-    try:
-        image = face_recognition.load_image_file(image_path)
-        if face_locations:
-            encodings = face_recognition.face_encodings(image, face_locations)
-            crops = FaceDetector.crop_faces(image, face_locations)
-            if encodings:
-                return (image_path, encodings, crops)
-    except Exception as e:
-        print(f"Encoding worker failed on {os.path.basename(image_path)}: {e}")
-    return None
+@st.cache_resource
+def get_people_db():
+    return PeopleDB(PEOPLE_DB)
 
-def cleanup_directory(dir_path):
-    """
-    Removes a directory and all its contents if it exists.
-    Retries a few times on Windows to handle "Device or resource busy" errors.
-    """
-    if not os.path.exists(dir_path):
-        return
-    
-    # Retry logic for shutil.rmtree, especially for Windows OS
-    max_retries = 5
-    delay = 1  # seconds
-    for attempt in range(max_retries):
-        try:
-            shutil.rmtree(dir_path)
-            return
-        except OSError as e:
-            # On Windows, rmtree can fail with "Device or resource busy"
-            # if a file handle is briefly held open.
-            if os.name == 'nt' and e.errno == 16: # errno 16 is "Device or resource busy"
-                time.sleep(delay)
-                continue
-            # Re-raise exceptions that are not the one we're handling
-            raise
-    
-    # If it still fails after retries, raise the last exception
-    st.error(f"Failed to cleanup directory {dir_path} after {max_retries} attempts.")
 
+# --- Helpers ---
 
 def create_zip_archive(src_dir, zip_filepath):
     """Creates a zip archive from a source directory."""
@@ -144,752 +57,631 @@ def create_zip_archive(src_dir, zip_filepath):
         for root, _, files in os.walk(src_dir):
             for file in files:
                 file_path = os.path.join(root, file)
-                archive_path = os.path.relpath(file_path, src_dir)
-                zipf.write(file_path, archive_path)
+                zipf.write(file_path, os.path.relpath(file_path, src_dir))
     return zip_filepath
 
-@st.cache_data
-def load_and_verify_image(file_path):
+
+EMPTY_REVIEW = {"names": {}, "merges": [], "rejected_pairs": set(),
+                "deleted": set(), "excluded": set(), "rescued": {}}
+
+
+def reset_review_state():
+    """Clears per-clustering review decisions (names, merges, deletions,
+    per-face removals and rescues)."""
+    st.session_state.review = {k: type(v)() for k, v in EMPTY_REVIEW.items()}
+
+
+def run_scan(paths, det_size, source_desc):
+    """Scans a list of files with progress UI and stores results in session."""
+    if not paths:
+        st.warning("No supported image files found.")
+        return
+    progress = st.progress(0.0, text="Scanning...")
+
+    def on_progress(done, total, name):
+        progress.progress(done / total, text=f"Scanning {done}/{total}: {name}")
+
+    faces, stats = scan_files(
+        paths,
+        det_size=det_size,
+        cache=get_scan_cache(),
+        detector_factory=lambda: get_detector(det_size),
+        progress_cb=on_progress,
+    )
+    progress.empty()
+
+    st.session_state.all_faces = faces
+    st.session_state.scan_stats = stats
+    st.session_state.scan_source = source_desc
+    st.session_state.pop("cluster_sig", None)
+    reset_review_state()
+
+
+def apply_merges(groups, merges):
+    """Folds merged groups into their targets, following chains."""
+    target_of = {}
+    for src, dst in merges:
+        # follow the chain in case dst was itself merged away
+        while dst in target_of:
+            dst = target_of[dst]
+        if src != dst:
+            target_of[src] = dst
+
+    for src, dst in target_of.items():
+        if src in groups and dst in groups:
+            merged = make_group(groups[dst]["name"],
+                                groups[dst]["faces"] + groups[src]["faces"])
+            merged["known"] = groups[dst]["known"]
+            groups[dst] = merged
+            del groups[src]
+    return groups
+
+
+def compute_groups(min_conf, min_height, eps, min_samples, match_dist):
     """
-    Loads and verifies an image file. Caches the result.
-    Returns True if the image is valid, False otherwise.
+    Filters the scanned faces, matches them against saved people, and
+    clusters the rest. Cheap enough to run on every rerun, which is what
+    makes the sliders feel instant.
     """
-    try:
-        with Image.open(file_path) as img:
-            img.verify()  # Verify the image is not corrupt
-        return True
-    except (IOError, SyntaxError, UnidentifiedImageError):
-        return False
+    people_db = get_people_db()
+    faces = filter_faces(st.session_state.all_faces,
+                         min_score=min_conf, min_height=min_height)
 
-def find_unique_name(directory, desired_name):
-    """
-    Finds a unique directory name to avoid collisions.
-    If 'desired_name' exists, it appends '_1', '_2', etc.
-    """
-    counter = 1
-    new_name = desired_name
-    while os.path.exists(os.path.join(directory, new_name)):
-        new_name = f"{desired_name}_{counter}"
-        counter += 1
-    return new_name
+    # Review decisions (renames, merges, per-face removals...) refer to
+    # group ids, which are only stable while the grouping inputs stay the
+    # same. Reset them if the settings or the people DB changed.
+    sig = (min_conf, min_height, eps, min_samples, match_dist,
+           len(st.session_state.all_faces), people_db.version())
+    if st.session_state.get("cluster_sig") != sig:
+        if ("cluster_sig" in st.session_state
+                and st.session_state.review != EMPTY_REVIEW):
+            st.info("Grouping inputs changed — unsaved review decisions "
+                    "were reset. Saved people are unaffected.")
+        st.session_state.cluster_sig = sig
+        reset_review_state()
+    review = st.session_state.review
 
-# --- Main Application Logic ---
-def run_processing_pipeline(uploaded_files, eps_value, min_face_area, face_detector_model, max_workers):
-    """
-    Executes the full face detection, clustering, and sorting pipeline.
-    """
-    try:
-        # --- Safeguard ---
-        # Clamp the number of workers to the defined limit to avoid crashing the system.
-        if max_workers > MAX_WORKERS_LIMIT:
-            st.warning(f"Limiting concurrent processes to {MAX_WORKERS_LIMIT} (system CPU count) to prevent system instability.")
-            max_workers = MAX_WORKERS_LIMIT
+    # Faces the user explicitly removed from a group sit out of everything
+    # and reappear in the Unsorted section.
+    excluded_out = [f for f in faces if crop_key(f) in review["excluded"]]
+    faces = [f for f in faces if crop_key(f) not in review["excluded"]]
 
-        # --- INITIALIZATION ---
-        cleanup_directory(TEMP_UPLOAD_DIR)
-        cleanup_directory(TEMP_CROP_DIR)
-        os.makedirs(TEMP_UPLOAD_DIR)
-        os.makedirs(TEMP_CROP_DIR)
+    # Saved people claim their faces first; only the rest get clustered.
+    people_centroids = people_db.centroids()
+    known_matches, remaining = match_known_people(
+        faces, people_centroids, match_dist)
+    people_names = {pid: nc[0] for pid, nc in people_centroids.items()}
 
-        # Initialize debug info holder in session state
-        st.session_state.debug_info = {}
-    
-        face_clusterer = FaceClusterer(eps=eps_value, min_samples=1)
-        file_organizer = FileOrganizer(output_dir=OUTPUT_DIR)
-        
-        all_encodings = []
-        file_face_map = {} # Maps original file paths to their encodings
-        face_data = [] # List of tuples: (encoding, crop_image)
+    if remaining:
+        embeddings = np.stack([f.embedding for f in remaining])
+    else:
+        embeddings = []
+    labels, _ = FaceClusterer(
+        eps=eps, min_samples=min_samples).cluster_faces(embeddings)
+    groups, unsorted_faces = group_faces(remaining, labels,
+                                         known_matches, people_names)
 
-        progress_bar = st.progress(0, text="Saving uploaded files...")
-
-        # 1. Save all uploaded files to a temporary directory first.
-        temp_file_paths = []
-        video_source_map = {} # Maps extracted frame paths back to their original video path
-
-        for uploaded_file in uploaded_files:
-            temp_file_path = Path(TEMP_UPLOAD_DIR) / uploaded_file.name
-            # Stream the file to disk in chunks to avoid loading it all into RAM
-            with open(temp_file_path, "wb") as f:
-                shutil.copyfileobj(uploaded_file, f)
-            
-            if temp_file_path.suffix.lower() in ['.mp4']:
-                st.info(f"Extracting frames from {temp_file_path.name}...")
-                video_frame_output_dir = Path(TEMP_UPLOAD_DIR) / "video_frames"
-                extracted_frames = MediaProcessor.extract_frames_from_video(temp_file_path, video_frame_output_dir)
-                temp_file_paths.extend(extracted_frames)
-                # For each extracted frame, store a mapping to the original video file
-                for frame in extracted_frames:
-                    video_source_map[frame] = temp_file_path
+    # User-approved rescues move unsorted faces into their group.
+    if review["rescued"]:
+        moved = defaultdict(list)
+        still_unsorted = []
+        for face in unsorted_faces:
+            gid = review["rescued"].get(crop_key(face))
+            if gid and gid in groups:
+                moved[gid].append(face)
             else:
-                temp_file_paths.append(temp_file_path)
+                still_unsorted.append(face)
+        unsorted_faces = still_unsorted
+        for gid, extras in moved.items():
+            rebuilt = make_group(groups[gid]["name"],
+                                 groups[gid]["faces"] + extras)
+            rebuilt["known"] = groups[gid]["known"]
+            groups[gid] = rebuilt
 
-        # 2. Process images using the selected model in parallel, with real-time progress.
-        successful_results = []
-        total_files = len(temp_file_paths)
-        processed_files_count = 0
+    groups = apply_merges(groups, review["merges"])
+    for gid in review["deleted"]:
+        groups.pop(gid, None)
+    for gid, name in review["names"].items():
+        if gid in groups:
+            groups[gid]["name"] = name
 
-        st.info(f"Found {total_files} files to process. Starting face detection...")
+    # Merge suggestions from centroid similarity, minus pairs already decided
+    decided = (review["rejected_pairs"]
+               | {tuple(sorted(m)) for m in review["merges"]})
+    merge_candidates = []
+    for id1, id2 in combinations(groups, 2):
+        distance = 1.0 - float(
+            np.dot(groups[id1]["centroid"], groups[id2]["centroid"]))
+        if distance < min(0.8, eps + 0.1) and tuple(sorted((id1, id2))) not in decided:
+            merge_candidates.append((id1, id2))
 
-        # Main progress bar
-        progress_bar = st.progress(0, text="Initializing...")
+    # Rescue suggestions: unsorted faces near a group, minus faces the user
+    # already decided on (removed from a group, or already rescued).
+    rescue_pool = [f for f in unsorted_faces
+                   if crop_key(f) not in review["excluded"]
+                   and crop_key(f) not in review["rescued"]]
+    rescue_map = suggest_rescues(groups, rescue_pool,
+                                 threshold=min(0.85, eps + RESCUE_MARGIN))
 
-        with ProcessPoolExecutor(
-                max_workers=max_workers,
-                initializer=init_worker,
-                initargs=(face_detector_model,)
-            ) as executor:
-        
-            futures = []
-            for path in temp_file_paths:
-                original_media_path = video_source_map.get(path, path)
-                future = executor.submit(_process_image_worker, (path, min_face_area, original_media_path))
-                futures.append(future)
-
-            for future in as_completed(futures):
-                result = future.result()
-                processed_files_count += 1
-                
-                if result:
-                    successful_results.append(result)
-
-                # Update progress bar with granular information
-                progress_percentage = processed_files_count / total_files
-                progress_text = f"Processing file {processed_files_count}/{total_files}: {os.path.basename(result[4].name if result else '...')}"
-                progress_bar.progress(progress_percentage, text=progress_text)
-
-        st.info("Gathering results...")
-        cluster_to_original_files = defaultdict(set)
-        
-        # Rebuild lists from only the successful results to ensure consistency
-        all_encodings = []
-        face_data = []
-
-        for i, result in enumerate(successful_results):
-            original_media_path, encodings, crop_paths, debug_info, processed_path = result
-            
-            # This is the key fix: use extend, not append, to keep the list flat
-            all_encodings.extend([(encoding, original_media_path) for encoding in encodings])
-            
-            if processed_path and debug_info:
-                 st.session_state.debug_info[os.path.basename(str(processed_path))] = debug_info
-            
-            # This logic also needs to be correct
-            face_data.extend([(encoding, crop_path) for encoding, crop_path in zip(encodings, crop_paths)])
-
-            progress_bar.progress((i + 1) / len(successful_results), text=f"Gathering results {i+1}/{len(successful_results)}...")
-
-        if not all_encodings:
-            st.warning("No faces were found in any of the uploaded images.")
-            cleanup_directory(TEMP_UPLOAD_DIR)
-            return None, 0, [], []
-        
-        progress_bar.progress(1.0, text="Clustering faces...")
-        # We need to unpack just the encodings for the clustering algorithm
-        just_encodings = [item[0] for item in all_encodings]
-        cluster_labels, num_clusters = face_clusterer.cluster_faces(just_encodings)
-        
-        # Now, map the original media files to their clusters
-        for i, label in enumerate(cluster_labels):
-            original_media_path = all_encodings[i][1]
-            cluster_to_original_files[label].add(original_media_path)
-
-        # Create a map of representative face crops for each cluster
-        cluster_representatives = {}
-        if num_clusters > 0:
-            crop_dir = os.path.join(OUTPUT_DIR, "face_previews")
-            os.makedirs(crop_dir, exist_ok=True)
-            for i, label in enumerate(cluster_labels):
-                if label not in cluster_representatives:
-                    # Use the face_data list, which is correctly indexed
-                    source_crop_path = face_data[i][1]
-                    dest_crop_path = os.path.join(crop_dir, f"rep_{label}.jpg")
-                    shutil.copy(source_crop_path, dest_crop_path)
-                    # The UI expects the full path for the representative face
-                    cluster_representatives[label] = dest_crop_path
-
-        # This part is to restore compatibility with the old UI logic
-        merge_candidates = []
-        cluster_to_dest_files = file_organizer.organize_files_into_folders(cluster_to_original_files)
-        
-        people = {}
-        if cluster_to_dest_files:
-            for cluster_id, files in sorted(cluster_to_dest_files.items()):
-                people[cluster_id] = {
-                    "name": f"Person_{cluster_id + 1}",
-                    "files": files,
-                    "representative_face": cluster_representatives.get(cluster_id)
-                }
-        
-        num_clusters = len(cluster_representatives)
-
-        cleanup_directory(TEMP_UPLOAD_DIR)
-        cleanup_directory(TEMP_CROP_DIR)
-
-        return people, num_clusters, merge_candidates, temp_file_paths
-    
-    except OperationCanceledError:
-        st.info("Operation cancelled by user.")
-        return None, 0, [], []
-    except Exception as e:
-        st.error(f"An unexpected error occurred during processing: {e}")
-        # Optionally, log the full traceback for debugging
-        # logger.exception("Unhandled error in run_processing_pipeline")
-        return None, 0, [], []
+    unsorted_faces = excluded_out + unsorted_faces
+    return groups, unsorted_faces, merge_candidates, rescue_map
 
 
-def run_diagnostic_tool():
+def show_face_crops(faces, columns=8, limit=None):
+    """Renders a grid of face thumbnail crops."""
+    shown = faces if limit is None else faces[:limit]
+    cols = st.columns(columns)
+    for i, face in enumerate(shown):
+        if face.crop_path and os.path.exists(face.crop_path):
+            cols[i % columns].image(face.crop_path, use_container_width=True)
+    if limit is not None and len(faces) > limit:
+        st.caption(f"...and {len(faces) - limit} more")
+
+
+def show_face_checkbox_grid(faces, dists, key_prefix, checkbox_label,
+                            columns=8, limit=24):
     """
-    Streamlit UI for the Face Detection Diagnostic Tool.
+    Grid of face crops, each with its distance-to-group and a checkbox
+    (used for both "remove from group" and "add to group" decisions).
+    Faces arrive sorted best-first, so the shakiest matches sit at the end.
     """
-    st.header("Face Detection Diagnostic Tool")
-    st.info(
-        "Upload an image to see how the face detection model identifies faces. "
-        "You can adjust the settings to see how they affect detection. "
-        "Faces with a green box are considered 'valid' based on the current settings. "
-        "Faces with a red box are detected but filtered out."
-    )
+    shown = list(zip(faces, dists))[:limit]
+    cols = st.columns(columns)
+    for i, (face, dist) in enumerate(shown):
+        with cols[i % columns]:
+            if face.crop_path and os.path.exists(face.crop_path):
+                st.image(face.crop_path, use_container_width=True)
+            st.checkbox(checkbox_label, key=f"{key_prefix}_{crop_key(face)}",
+                        help=f"Distance to group: {dist:.2f} "
+                             "(lower = more similar)")
+    if len(faces) > limit:
+        st.caption(f"...and {len(faces) - limit} more")
 
-    # --- UI for settings ---
-    st.sidebar.header("Diagnostic Settings")
-    
-    # Model selection
-    face_detector_model = st.sidebar.selectbox(
-        "Face Detection Model",
-        ("hog", "cnn"),
-        index=0, # Default to 'hog'
-        help="'hog' is faster but less accurate. 'cnn' is a more accurate deep learning model but much slower on CPU.",
-        key="diagnostic_model" # Unique key
-    )
 
-    # Min face area slider
-    min_face_area = st.sidebar.number_input(
-        "Minimum Face Area (pixels)",
-        min_value=0,
-        max_value=3000000,
-        value=300000,
-        step=1000,
-        help="Filters out detected faces smaller than this area (width * height).",
-        key="diagnostic_min_area" # Unique key
-    )
-    
-    # --- File Uploader ---
-    uploaded_file = st.file_uploader(
-        "Choose an image file",
-        type=['jpg', 'jpeg', 'png'],
-        key="diagnostic_uploader" # Unique key
-    )
+# --- Folder browser (server-side; the browser can't hand us local paths) ---
 
-    if uploaded_file is not None:
-        # To use the face detector, we need to save the file to a temporary path
-        temp_dir = Path(TEMP_UPLOAD_DIR)
-        temp_dir.mkdir(exist_ok=True)
-        temp_file_path = temp_dir / uploaded_file.name
-        
-        with open(temp_file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+def _browse_to(path):
+    st.session_state.browse_dir = str(path)
 
-        st.image(uploaded_file, caption=f"Original Image: {uploaded_file.name}", use_container_width=True)
 
-        with st.spinner("Detecting faces..."):
+def _use_browse_dir():
+    st.session_state.folder_input = st.session_state.browse_dir
+
+
+def render_folder_browser():
+    """Clickable folder navigation that fills the folder-path box."""
+    browse_dir = Path(st.session_state.get("browse_dir", Path.home()))
+    if not browse_dir.is_dir():
+        browse_dir = Path.home()
+        st.session_state.browse_dir = str(browse_dir)
+
+    with st.container(border=True):
+        up_col, home_col, path_col = st.columns([0.08, 0.08, 0.84])
+        up_col.button("⬆️", help="Up one level", on_click=_browse_to,
+                      args=(browse_dir.parent,),
+                      disabled=browse_dir.parent == browse_dir)
+        home_col.button("🏠", help="Go to your home folder",
+                        on_click=_browse_to, args=(Path.home(),))
+        path_col.code(str(browse_dir), language=None)
+
+        try:
+            entries = list(browse_dir.iterdir())
+        except PermissionError:
+            st.warning("Permission denied for this folder.")
+            entries = []
+        subdirs = sorted(
+            (p for p in entries if p.is_dir() and not p.name.startswith('.')),
+            key=lambda p: p.name.lower())
+        image_count = sum(
+            1 for p in entries if p.is_file()
+            and p.suffix.lower() in MediaProcessor.SUPPORTED_IMAGE_FORMATS)
+
+        st.button(f"✅ Use this folder ({image_count} images here, "
+                  "subfolders included at scan)",
+                  on_click=_use_browse_dir, use_container_width=True)
+
+        max_shown = 32
+        if subdirs:
+            cols = st.columns(4)
+            for i, sub in enumerate(subdirs[:max_shown]):
+                cols[i % 4].button(
+                    f"📁 {sub.name}", key=f"browse_{sub}",
+                    on_click=_browse_to, args=(sub,),
+                    use_container_width=True)
+            if len(subdirs) > max_shown:
+                st.caption(f"...and {len(subdirs) - max_shown} more subfolders "
+                           "(type the path above to jump directly)")
+
+
+# --- Main app sections ---
+
+def _delete_person(person_id):
+    get_people_db().delete_person(person_id)
+
+
+def render_people_sidebar():
+    """Sidebar manager for the persistent people database."""
+    people = get_people_db().list_people()
+    with st.sidebar.expander(f"👥 Saved people ({len(people)})"):
+        if not people:
+            st.caption("None yet. After a scan, tick '💾 Save person' on a "
+                       "group to remember them — future scans will name "
+                       "their folder automatically.")
+        for person in people:
+            crop_col, name_col, del_col = st.columns([0.22, 0.56, 0.22])
+            if person["sample_crop"] and os.path.exists(person["sample_crop"]):
+                crop_col.image(person["sample_crop"], use_container_width=True)
+            name_col.write(f"**{person['name']}**")
+            name_col.caption(f"{person['n_faces']} faces")
+            del_col.button("🗑", key=f"delperson_{person['id']}",
+                           on_click=_delete_person, args=(person["id"],),
+                           help=f"Forget {person['name']} permanently.")
+
+
+def render_input_section(det_size):
+    st.subheader("1. Choose photos")
+    folder_tab, upload_tab = st.tabs(["📁 Local folder", "⬆️ Upload files"])
+
+    with folder_tab:
+        if st.toggle("📂 Browse for a folder",
+                     help="Navigate your folders by clicking instead of "
+                          "typing a path."):
+            render_folder_browser()
+        folder = st.text_input(
+            "Folder path",
+            key="folder_input",
+            placeholder="/path/to/unsorted_photos",
+            help="Scanned recursively for images. Nothing is moved or "
+                 "modified — sorted copies are made at export time.",
+        )
+        if st.button("Scan Folder", type="primary", disabled=not folder):
             try:
-                # --- Run Detection ---
-                detector = FaceDetector(model=face_detector_model)
-                # We pass 0 for min_face_area to get ALL faces, then filter visually.
-                image_data, _, _, debug_info = detector.detect_faces(
-                    temp_file_path,
-                    min_face_area=0 
-                )
+                paths = MediaProcessor(folder).discover_media()
+            except FileNotFoundError:
+                st.error(f"Folder not found: {folder}")
+                return
+            run_scan(paths, det_size, folder)
 
-                if image_data is None:
-                    st.error("Could not read the uploaded image file. It might be corrupt.")
-                elif not debug_info:
-                    st.warning("No faces were detected in the image.")
+    with upload_tab:
+        uploaded = st.file_uploader(
+            "Choose images",
+            type=['jpg', 'jpeg', 'png', 'webp', 'bmp'],
+            accept_multiple_files=True,
+        )
+        if uploaded and st.button("Scan Uploads", type="primary"):
+            upload_dir = Path(TEMP_UPLOAD_DIR)
+            shutil.rmtree(upload_dir, ignore_errors=True)
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            paths = []
+            for file in uploaded:
+                dest = upload_dir / os.path.basename(file.name)
+                with open(dest, "wb") as f:
+                    shutil.copyfileobj(file, f)
+                paths.append(dest)
+            run_scan(paths, det_size, f"{len(paths)} uploaded files")
+
+
+def _apply_group_form(groups, rescue_map, sig_key):
+    """Records every decision from the big review form."""
+    review = st.session_state.review
+    people_db = get_people_db()
+
+    for gid, group in groups.items():
+        if st.session_state.get(f"delete_{sig_key}_{gid}"):
+            review["deleted"].add(gid)
+            continue
+
+        raw = st.session_state.get(f"name_{sig_key}_{gid}", "")
+        sanitized = "".join(
+            c for c in raw if c.isalnum() or c in (' ', '_', '-')).strip()
+        final_name = sanitized or group["name"]
+        if sanitized and sanitized != group["name"]:
+            review["names"][gid] = sanitized
+
+        for face in group["faces"]:
+            if st.session_state.get(f"exclude_{sig_key}_{crop_key(face)}"):
+                review["excluded"].add(crop_key(face))
+
+        for face, _dist in rescue_map.get(gid, []):
+            if st.session_state.get(f"rescue_{sig_key}_{gid}_{crop_key(face)}"):
+                review["rescued"][crop_key(face)] = gid
+
+        if st.session_state.get(f"save_{sig_key}_{gid}"):
+            kept = [f for f in group["faces"]
+                    if crop_key(f) not in review["excluded"]]
+            rescued_in = [f for f, _d in rescue_map.get(gid, [])
+                          if review["rescued"].get(crop_key(f)) == gid]
+            try:
+                if group["known"]:
+                    person_id = int(gid[1:])
+                    if final_name != group["name"]:
+                        people_db.rename_person(person_id, final_name)
                 else:
-                    st.success(f"Detected {len(debug_info)} face(s).")
-                    
-                    # --- Draw Boxes and Display ---
-                    tagged_image = FaceDetector.draw_diagnostic_tags(
-                        image_data,
-                        debug_info,
-                        min_face_area
+                    person_id = people_db.add_or_get_person(final_name)
+                people_db.enroll_faces(person_id, kept + rescued_in)
+                st.toast(f"Saved {final_name} "
+                         f"({len(kept) + len(rescued_in)} faces)")
+            except sqlite3.IntegrityError:
+                st.warning(f"A person named '{final_name}' already exists — "
+                           "pick a different name or delete the other one "
+                           "in the sidebar.")
+
+
+def render_groups_section(groups, unsorted_faces, merge_candidates,
+                          rescue_map):
+    st.subheader("2. Review groups")
+    stats = st.session_state.scan_stats
+    total_faces = sum(len(g["faces"]) for g in groups.values())
+    st.caption(
+        f"Source: {st.session_state.scan_source} — "
+        f"{stats['total']} files ({stats['cached']} from cache, "
+        f"{stats['unreadable']} unreadable) · "
+        f"{total_faces} faces in {len(groups)} groups, "
+        f"{len(unsorted_faces)} unsorted."
+    )
+
+    # --- Merge suggestions ---
+    if merge_candidates:
+        with st.container(border=True):
+            st.markdown("**Suggested merges** — these groups look like the "
+                        "same person:")
+            with st.form("merge_form"):
+                for i, (id1, id2) in enumerate(merge_candidates):
+                    col1, col2, col3 = st.columns([0.15, 0.15, 0.7])
+                    for col, gid in ((col1, id1), (col2, id2)):
+                        rep = groups[gid]["rep_face"]
+                        if rep.crop_path and os.path.exists(rep.crop_path):
+                            col.image(rep.crop_path, use_container_width=True)
+                        col.caption(groups[gid]["name"])
+                    col3.radio(
+                        f"Merge **{groups[id2]['name']}** into "
+                        f"**{groups[id1]['name']}**?",
+                        options=["Skip", "Merge", "Not the same person"],
+                        key=f"merge_choice_{id1}_{id2}",
+                        horizontal=True,
                     )
-                    
-                    st.image(tagged_image, caption="Detection Results", use_container_width=True)
-                    
-                    # Display summary of faces
-                    valid_faces = [info for info in debug_info if info[1] >= min_face_area]
-                    st.metric(label="Valid Faces Found", value=f"{len(valid_faces)} / {len(debug_info)}")
+                if st.form_submit_button("Apply merge decisions"):
+                    review = st.session_state.review
+                    for id1, id2 in merge_candidates:
+                        choice = st.session_state.get(f"merge_choice_{id1}_{id2}")
+                        if choice == "Merge":
+                            review["merges"].append((id2, id1))
+                        elif choice == "Not the same person":
+                            review["rejected_pairs"].add(tuple(sorted((id1, id2))))
+                    st.rerun()
 
-                    st.subheader("Detected Face Details")
-                    if not debug_info:
-                        st.info("No faces to detail.")
-                    else:
-                        for i, (loc, area) in enumerate(debug_info):
-                            is_valid = area >= min_face_area
-                            status = "✅ Valid" if is_valid else "❌ Below Threshold"
-                            st.markdown(f"**Face {i+1}**: Area = `{int(area)}` pixels ({status})")
+    # --- Group list with rename/delete/save/per-face review ---
+    sig_key = hashlib.sha1(str(st.session_state.cluster_sig).encode()).hexdigest()[:8]
+    with st.form("groups_form"):
+        st.caption("Rename groups, save them to the People database, mark "
+                   "groups for removal, or untick individual faces — then "
+                   "apply. Giving two groups the same name combines them "
+                   "at export.")
+        for gid, group in groups.items():
+            with st.container(border=True):
+                col1, col2 = st.columns([0.12, 0.88])
+                with col1:
+                    rep = group["rep_face"]
+                    if rep.crop_path and os.path.exists(rep.crop_path):
+                        st.image(rep.crop_path, use_container_width=True)
+                with col2:
+                    name_col, save_col, del_col = st.columns([0.5, 0.27, 0.23])
+                    name_col.text_input(
+                        "Group name", value=group["name"],
+                        key=f"name_{sig_key}_{gid}",
+                        label_visibility="collapsed",
+                    )
+                    save_col.checkbox(
+                        "💾 Save person", key=f"save_{sig_key}_{gid}",
+                        help="Remember this person permanently. Future "
+                             "scans will recognize them and name their "
+                             "folder automatically.")
+                    del_col.checkbox("Remove", key=f"delete_{sig_key}_{gid}",
+                                     help="Don't export this group.")
+                    known_badge = " · ✅ saved person" if group["known"] else ""
+                    st.caption(f"{len(group['faces'])} faces in "
+                               f"{len(group['files'])} photos{known_badge}")
+                    with st.expander("Show faces and files"):
+                        st.caption("Sorted best match first — check the "
+                                   "last few for strangers. Tick ✕ to move "
+                                   "a face out of this group.")
+                        show_face_checkbox_grid(
+                            group["faces"], group["face_dists"],
+                            key_prefix=f"exclude_{sig_key}",
+                            checkbox_label="✕")
+                        st.code("\n".join(sorted(
+                            os.path.basename(p) for p in group["files"])))
+                    if gid in rescue_map:
+                        with st.expander(
+                                f"🔎 {len(rescue_map[gid])} unsorted "
+                                f"face(s) might also be "
+                                f"{group['name']}", expanded=True):
+                            st.caption("Tick ➕ to add a face (and its "
+                                       "photo) to this group.")
+                            pairs = rescue_map[gid]
+                            show_face_checkbox_grid(
+                                [p[0] for p in pairs], [p[1] for p in pairs],
+                                key_prefix=f"rescue_{sig_key}_{gid}",
+                                checkbox_label="➕")
 
-            except Exception as e:
-                st.error(f"An error occurred during face detection: {e}")
-            finally:
-                # Clean up the temp file
-                if temp_file_path.exists():
-                    os.remove(temp_file_path)
+        if st.form_submit_button("Apply changes", type="primary",
+                                 use_container_width=True):
+            _apply_group_form(groups, rescue_map, sig_key)
+            st.rerun()
+
+    # --- Unsorted faces ---
+    if unsorted_faces:
+        with st.expander(f"🫥 Unsorted faces ({len(unsorted_faces)}) — didn't "
+                         "match any group"):
+            st.caption("Usually tiny/blurry faces or one-off detections. "
+                       "Faces close to an existing group are offered inside "
+                       "that group's card above; otherwise raise 'Cluster "
+                       "distance' or lower 'Min faces per group' to pull "
+                       "more of these into groups.")
+            show_face_crops(unsorted_faces, limit=48)
 
 
-class OperationCanceledError(Exception):
-    """Exception raised when the user cancels the operation."""
-    pass
+def render_export_section(groups):
+    st.subheader("3. Export")
+    output_dir = st.text_input("Output folder", value=OUTPUT_DIR)
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("Export sorted folders", type="primary",
+                     use_container_width=True, disabled=not groups):
+            # Groups sharing a name are intentionally combined into one folder
+            merged_by_name = {}
+            for gid, group in groups.items():
+                entry = merged_by_name.setdefault(
+                    group["name"], {"name": group["name"], "files": set()})
+                entry["files"] |= group["files"]
+            with st.spinner("Copying files..."):
+                copied = FileOrganizer(output_dir).export(
+                    {name: g for name, g in merged_by_name.items()})
+            total = sum(copied.values())
+            st.session_state.exported_dir = output_dir
+            st.success(f"Copied {total} files into {len(copied)} folders "
+                       f"under {output_dir}")
+
+    with col2:
+        exported = st.session_state.get("exported_dir")
+        if exported and os.path.isdir(exported):
+            zip_path = os.path.join(os.path.dirname(exported) or ".",
+                                    "sorted_photos.zip")
+            if st.button("Create ZIP of export", use_container_width=True):
+                with st.spinner("Zipping..."):
+                    create_zip_archive(exported, zip_path)
+                st.session_state.zip_ready = zip_path
+            zip_ready = st.session_state.get("zip_ready")
+            if zip_ready and os.path.exists(zip_ready):
+                with open(zip_ready, "rb") as fp:
+                    st.download_button("Download ZIP", data=fp,
+                                       file_name="sorted_photos.zip",
+                                       mime="application/zip",
+                                       use_container_width=True)
 
 
-# --- Streamlit UI ---
+def run_diagnostic_tool(det_size, min_conf, min_height):
+    st.header("Face Detection Diagnostic Tool")
+    st.info("Upload one photo to see exactly what the detector finds. "
+            "Green boxes pass your current sidebar filters; red boxes were "
+            "detected but filtered out. Use this to tune confidence and "
+            "face-size settings for your photo conditions.")
+
+    uploaded = st.file_uploader("Choose an image", type=['jpg', 'jpeg', 'png', 'webp'])
+    if uploaded is None:
+        return
+
+    temp_dir = Path(TEMP_UPLOAD_DIR)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = temp_dir / f"diagnostic_{os.path.basename(uploaded.name)}"
+    with open(temp_path, "wb") as f:
+        f.write(uploaded.getbuffer())
+
+    with st.spinner("Detecting faces..."):
+        detector = get_detector(det_size)
+        faces = detector.detect_faces(temp_path)
+
+    if faces is None:
+        st.error("Could not read the uploaded image. It might be corrupt.")
+        return
+    if not faces:
+        st.warning("No faces detected at all. Try a higher detector "
+                   "resolution in the sidebar.")
+        return
+
+    bgr = FaceDetector.load_image_bgr(temp_path)
+    st.image(draw_diagnostic_boxes(bgr, faces, min_conf, min_height),
+             use_container_width=True)
+
+    passing = filter_faces(faces, min_conf, min_height)
+    st.metric("Faces passing filters", f"{len(passing)} / {len(faces)}")
+    for i, face in enumerate(faces):
+        ok = face.score >= min_conf and face.height >= min_height
+        status = "✅ kept" if ok else "❌ filtered out"
+        st.markdown(f"**Face {i + 1}**: confidence `{face.score:.2f}`, "
+                    f"height `{int(face.height)}px` ({status})")
+
+
 def main():
-    """Streamlit web interface for the FaceSorter application."""
     st.set_page_config(page_title="FaceSorter", layout="wide")
 
-    # Register a cleanup function to be called upon script exit.
-    # This will attempt to remove the sorted output directory.
-    # Note: This may not run if the app is terminated forcefully.
-    # atexit.register(cleanup_directory, OUTPUT_DIR) # Disabling this as it causes premature deletion
+    if "review" not in st.session_state:
+        reset_review_state()
 
-    # --- Initialize Session State & Background Worker ---
-    if 'file_op_queue' not in st.session_state:
-        st.session_state.file_op_queue = Queue()
-    if 'file_worker_thread_running' not in st.session_state:
-        st.session_state.file_worker_thread_running = False
-    
-    start_file_worker() # Now it's safe to call this.
-
+    # --- Sidebar ---
     st.sidebar.title("⚙️ Settings")
-    app_mode = st.sidebar.radio(
-        "Choose the app mode",
-        ("Face Sorter", "Diagnostic Tool")
-    )
+    app_mode = st.sidebar.radio("App mode", ("Face Sorter", "Diagnostic Tool"))
 
-    if app_mode == "Face Sorter":
-        st.title("📷 FaceSorter")
-        st.write("Upload a batch of photos, and this tool will automatically sort them into folders based on the people identified in them.")
+    st.sidebar.subheader("Detection (applies at scan time)")
+    det_size = st.sidebar.select_slider(
+        "Detector resolution", options=[640, 1024, 1600],
+        value=config.get("detection.det_size", 640),
+        help="Higher finds smaller/further faces but scans slower. "
+             "Changing this requires a re-scan.")
 
-        # --- Settings Sidebar ---
-        model_choice = st.sidebar.selectbox(
-            "Face Detection Model",
-            ("hog", "cnn"),
-            index=0, # Default to hog
-            help="Choose the model for detecting faces. 'hog' is faster and works well for clear, front-facing photos. 'cnn' is a more powerful deep learning model that is better at detecting faces at various angles (like profiles) but is much slower (a GPU is recommended)."
-        )
+    st.sidebar.subheader("Face filters (instant)")
+    min_conf = st.sidebar.slider(
+        "Min detection confidence", 0.30, 0.90,
+        value=float(config.get("detection.min_confidence", 0.5)), step=0.01,
+        help="Faces the detector is less sure about are ignored. Lower this "
+             "if real faces are being missed; raise it if non-faces slip in.")
+    min_height = st.sidebar.slider(
+        "Min face height (px)", 0, 500,
+        value=int(config.get("detection.min_face_height", 40)), step=5,
+        help="Ignore faces smaller than this — background strangers, "
+             "photo-bombers, faces on posters.")
 
-        # Set a smart default for eps based on the chosen model
-        default_eps = 0.4 if model_choice == 'cnn' else 0.6
-        eps_help_text = (
-            "Controls how similar faces must be to be grouped. Lower is stricter."
-            " • If different people are in the same group, **decrease** this value."
-            " • If the same person is in multiple groups, **increase** this value."
-            " • Recommended start for 'cnn' is ~0.4. Recommended for 'hog' is ~0.6."
-        )
+    st.sidebar.subheader("Grouping (instant)")
+    eps = st.sidebar.slider(
+        "Cluster distance (eps)", 0.20, 0.80,
+        value=float(config.get("clustering.eps", 0.5)), step=0.01,
+        help="How similar two faces must be to be the same person. "
+             "If one person is split across groups, increase it. "
+             "If different people share a group, decrease it.")
+    min_samples = st.sidebar.slider(
+        "Min faces per group", 1, 5,
+        value=int(config.get("clustering.min_samples", 2)),
+        help="Groups need at least this many faces; loners go to 'Unsorted'. "
+             "Set to 1 to give every face a group.")
+    match_dist = st.sidebar.slider(
+        "Saved-person match distance", 0.20, 0.80,
+        value=float(config.get("clustering.match_distance", 0.45)), step=0.01,
+        help="How close a face must be to a saved person to be recognized "
+             "automatically. Only matters once you've saved people.")
 
-        eps_value = st.sidebar.slider(
-            "Clustering Sensitivity (eps)",
-            min_value=0.1,
-            max_value=1.0,
-            value=default_eps, # Smart default
-            step=0.01,
-            help=eps_help_text
-        )
+    render_people_sidebar()
 
-        max_workers = st.sidebar.slider(
-            "Parallel Workers",
-            min_value=1,
-            max_value=os.cpu_count() or 1,
-            value=max(1, (os.cpu_count() or 1) // 2),  # Default to half the CPU cores
-            step=1,
-            help="Number of parallel processes to use for face detection. More workers can be faster but will use more RAM. Reduce this if you experience crashes with many files."
-        )
+    if st.sidebar.button("Clear scan cache",
+                         help="Forget all cached scans; next scan re-detects "
+                              "everything from scratch."):
+        get_scan_cache().clear()
+        st.sidebar.success("Scan cache cleared.")
 
-        show_debugger = st.sidebar.checkbox("Show Face Size Debugger")
+    if app_mode == "Diagnostic Tool":
+        run_diagnostic_tool(det_size, min_conf, min_height)
+        return
 
-        min_face_area = st.sidebar.number_input(
-            "Minimum Face Area (pixels)",
-            min_value=0,
-            max_value=3000000,
-            value=300000,
-            step=1000,
-            help="Sets the minimum size for a face to be detected. Faces with a pixel area (width * height) smaller than this value will be ignored. Higher values will filter out more (smaller) faces."
-        )
+    # --- Face Sorter flow ---
+    st.title("📷 FaceSorter")
+    st.write("Point FaceSorter at your photos and it sorts them into a folder "
+             "per person — group photos are copied into every member's folder.")
 
-        # --- File Uploader ---
-        uploaded_files = st.file_uploader(
-            "Choose images or videos to sort",
-            type=['jpg', 'jpeg', 'png', 'mp4'],
-            accept_multiple_files=True
-        )
+    render_input_section(det_size)
 
-        if uploaded_files:
-            # --- File Display Options ---
-            st.sidebar.write("---")
-            st.sidebar.subheader("File Display Options")
-            display_count_option = st.sidebar.radio(
-                "Show per page",
-                options=['1', '5', '10', '25', 'All'],
-                index=2, # Default to 10
-                horizontal=True
-            )
-            
-            # Initialize session state for pagination and display options
-            if 'page_number' not in st.session_state:
-                st.session_state.page_number = 0
-            if 'display_count_option' not in st.session_state:
-                st.session_state.display_count_option = display_count_option
+    if st.session_state.get("all_faces") is None:
+        return
+    if not st.session_state.all_faces:
+        st.warning("No faces were found in the scanned photos.")
+        return
 
-            # Reset page number if the display count changes, to prevent an invalid state
-            if st.session_state.display_count_option != display_count_option:
-                st.session_state.page_number = 0
-                st.session_state.display_count_option = display_count_option
+    groups, unsorted_faces, merge_candidates, rescue_map = compute_groups(
+        min_conf, min_height, eps, min_samples, match_dist)
 
-            display_count = len(uploaded_files) if display_count_option == 'All' else int(display_count_option)
-
-            # --- Paginated File Display ---
-            start_index = st.session_state.page_number * display_count
-            end_index = start_index + display_count
-            files_to_display = uploaded_files[start_index:end_index]
-
-            st.write(f"Showing {start_index + 1}-{min(end_index, len(uploaded_files))} of {len(uploaded_files)} files.")
-            
-            # Display file previews in columns
-            num_columns = min(display_count, 5) # Use at most 5 columns, or less if fewer are shown
-            cols = st.columns(num_columns)
-            for i, file in enumerate(files_to_display):
-                with cols[i % num_columns]:
-                    if file.type.startswith("image/"):
-                        st.image(file, width=100)
-                    else:
-                        st.video(file) # Use st.video for video files
-                    st.caption(file.name)
-
-            # --- Pagination Controls ---
-            col1, col2, col3 = st.columns([1, 1, 8])
-            if st.session_state.page_number > 0:
-                if col1.button("⬅️ Previous"):
-                    st.session_state.page_number -= 1
-                    st.rerun()
-
-            if end_index < len(uploaded_files):
-                if col2.button("Next ➡️"):
-                    st.session_state.page_number += 1
-                    st.rerun()
-
-            st.write("---")
-            if st.button("Sort Photos", type="primary", use_container_width=True):
-                # Clean up previous results only when a new sort is initiated
-                cleanup_directory(OUTPUT_DIR)
-                with st.spinner("Analyzing and sorting your photos..."):
-                    people, num_clusters, merge_candidates, temp_file_paths = run_processing_pipeline(
-                        uploaded_files, eps_value, min_face_area, model_choice, max_workers
-                    )
-
-                    # Store results in session state to persist across reruns
-                    if people is not None:
-                        st.session_state.people = people
-                        st.session_state.num_clusters = num_clusters
-                        st.session_state.merge_candidates = merge_candidates
-                        st.session_state.zip_archive = None
-                        st.session_state.temp_paths = temp_file_paths
-            
-        # --- Face Size Debugger ---
-        if show_debugger and 'debug_info' in st.session_state and st.session_state.debug_info:
-            st.write("---")
-            st.header("🔍 Face Size Debugger")
-            st.info("This shows every face found in your images *before* the sensitivity filter is applied. Use this to find the size of unwanted faces and set the slider accordingly.")
-            
-            # Sort items by filename for consistent display
-            sorted_debug_items = sorted(st.session_state.debug_info.items())
-
-            for filename, debug_data in sorted_debug_items:
-                with st.container(border=True):
-                    st.subheader(filename)
-                    
-                    face_locations_with_areas = debug_data.get("face_locations")
-                    if not face_locations_with_areas:
-                        st.write("No faces detected in this image.")
-                        continue
-                    
-                    # Find the original path to the temp file to display the image
-                    original_path = next((path for path in st.session_state.get('temp_paths', []) if os.path.basename(str(path)) == filename), None)
-                    
-                    if original_path and os.path.exists(original_path):
-                        try:
-                            # Load the image and draw the tags
-                            image_data = face_recognition.load_image_file(original_path)
-                            tagged_image = FaceDetector.draw_face_tags(image_data, face_locations_with_areas)
-                            st.image(tagged_image, use_container_width=True)
-                        except Exception as e:
-                            st.warning(f"Could not display debug image for {filename}: {e}")
-
-                    areas = [f"Face #{i+1}: {int(area)} pixels" for i, (loc, area) in enumerate(face_locations_with_areas)]
-                    st.write("Detected face sizes (width * height):")
-                    st.code("\n".join(areas))
-
-        # --- Manual Review Section ---
-        if 'merge_candidates' in st.session_state and st.session_state.merge_candidates:
-            st.write("---")
-            st.header("Manual Review")
-            st.info("The algorithm found groups that are very similar. Review and merge them if they are the same person.")
-            
-            with st.form(key="merge_form"):
-                # --- Display Individual Merge Candidates ---
-                for i, (id1, id2) in enumerate(st.session_state.merge_candidates):
-                    # Make sure both people still exist before offering to merge
-                    if id1 not in st.session_state.people or id2 not in st.session_state.people:
-                        continue
-
-                    person1 = st.session_state.people[id1]
-                    person2 = st.session_state.people[id2]
-                    
-                    st.write(f"Merge **{person2['name']}** into **{person1['name']}**?")
-                    
-                    col1, col2, col3 = st.columns([0.2, 0.2, 0.6])
-                    with col1:
-                        if person1.get("representative_face") and os.path.exists(person1["representative_face"]):
-                            st.image(person1["representative_face"], use_container_width=True)
-                    with col2:
-                        if person2.get("representative_face") and os.path.exists(person2["representative_face"]):
-                            st.image(person2["representative_face"], use_container_width=True)
-
-                    with col3:
-                        st.radio(
-                            "Action",
-                            options=["Skip", "Merge", "Reject"],
-                            key=f"merge_decision_{i}",
-                            horizontal=True,
-                            label_visibility="collapsed"
-                        )
-                    st.write("---") # Add a separator
-
-                # --- Form Submission Button ---
-                submitted = st.form_submit_button(
-                    "Apply Merge Decisions", 
-                    type="primary", 
-                    use_container_width=True
-                )
-
-                if submitted:
-                    processed_candidates = []
-                    merged_away_ids = set()
-                    any_action_taken = False
-
-                    # Iterate through all candidates to process the decisions
-                    for i, (id1, id2) in enumerate(st.session_state.merge_candidates):
-                        decision_key = f"merge_decision_{i}"
-                        decision = st.session_state.get(decision_key, "Skip")
-
-                        # If a person in this pair was already merged into another, skip this pair
-                        if id1 in merged_away_ids or id2 in merged_away_ids:
-                            continue
-
-                        if decision == "Merge":
-                            any_action_taken = True
-                            person1 = st.session_state.people[id1]
-                            person2 = st.session_state.people[id2]
-                            
-                            # The new logic is to move all files from person2's dir to person1's
-                            # The file paths in the session state are inside the person's folder, so we can get the dir from the first file.
-                            if person1['files'] and person2['files']:
-                                person1_dir = os.path.dirname(list(person1['files'])[0])
-                                person2_dir = os.path.dirname(list(person2['files'])[0])
-                                
-                                # Perform synchronously to avoid race conditions on UI rerun
-                                if os.path.isdir(person2_dir) and os.path.isdir(person1_dir):
-                                    for filename in os.listdir(person2_dir):
-                                        shutil.move(os.path.join(person2_dir, filename), os.path.join(person1_dir, filename))
-                                    shutil.rmtree(person2_dir)
-                                
-                                # Update the state immediately for UI responsiveness
-                                # Calculate the new paths for the moved files
-                                moved_files_new_paths = {os.path.join(person1_dir, os.path.basename(f)) for f in person2['files']}
-                                st.session_state.people[id1]['files'].update(moved_files_new_paths)
-                                
-                                merged_away_ids.add(id2)
-                            
-                            processed_candidates.append((id1, id2))
-                        
-                        elif decision == "Reject":
-                            any_action_taken = True
-                            processed_candidates.append((id1, id2))
-
-                    # After processing all decisions, clean up the state
-                    if any_action_taken:
-                        # Remove the people who were merged away
-                        for person_id in merged_away_ids:
-                            if person_id in st.session_state.people:
-                                del st.session_state.people[person_id]
-                        
-                        # Remove the candidate pairs that were actioned
-                        st.session_state.merge_candidates = [
-                            cand for cand in st.session_state.merge_candidates if cand not in processed_candidates
-                        ]
-                        
-                        st.session_state.zip_archive = None # Invalidate zip
-                        st.rerun()
-
-        # --- Display Results ---
-        if 'people' in st.session_state and st.session_state.people:
-            st.write("---")
-            st.header("Sorted Results")
-            
-            # --- Download Button ---
-            st.info("Actions like merging or renaming will require you to generate a new ZIP file.")
-            zip_path = "sorted_photos.zip"
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("Generate Download Link", use_container_width=True, key="generate_zip"):
-                    with st.spinner("Creating download archive... this may take a moment."):
-                        create_zip_archive(OUTPUT_DIR, zip_path)
-                        st.session_state.zip_archive = zip_path
-                        st.rerun()
-
-            with col2:
-                zip_ready = st.session_state.get('zip_archive') and os.path.exists(st.session_state.get('zip_archive'))
-                if zip_ready:
-                    with open(st.session_state.zip_archive, "rb") as fp:
-                        st.download_button(
-                            label="Download All as ZIP",
-                            data=fp,
-                            file_name="sorted_photos.zip",
-                            mime="application/zip",
-                            use_container_width=True
-                        )
-                else:
-                    st.download_button(
-                        label="Download All as ZIP",
-                        data=b"",
-                        file_name="sorted_photos.zip",
-                        mime="application/zip",
-                        disabled=True,
-                        use_container_width=True,
-                        help="Click 'Generate Download Link' first to create the ZIP file."
-                    )
-            
-            # --- Form for Bulk Operations ---
-            with st.form(key="results_form"):
-                st.info("Edit names, or mark groups for deletion. When finished, click 'Apply All Changes' at the bottom.")
-                st.write("---")
-
-                # --- Display Folders and Images ---
-                for person_id, person_data in st.session_state.people.items():
-                    with st.container(border=True):
-                        old_person_name = person_data['name']
-
-                        col1, col2 = st.columns([0.1, 0.9])
-                        with col1:
-                            if person_data.get("representative_face") and os.path.exists(person_data["representative_face"]):
-                                st.image(person_data["representative_face"])
-
-                        with col2:
-                            # --- Renaming Input & Remove Checkbox ---
-                            rename_col, delete_col = st.columns([0.8, 0.2])
-                            with rename_col:
-                                st.text_input(
-                                    "Group Name", 
-                                    value=old_person_name, 
-                                    key=f"new_name_{person_id}",
-                                    label_visibility="collapsed"
-                                )
-                            with delete_col:
-                                st.checkbox("Delete", key=f"delete_{person_id}", help="Mark this group for deletion.")
-
-                            # --- Displaying Files (Read-Only in Form) ---
-                            with st.expander(f"Show {len(person_data['files'])} files"):
-                                num_cols = 8
-                                cols = st.columns(num_cols)
-                                
-                                file_list = sorted(list(person_data['files']))
-
-                                for i, file_path_str in enumerate(file_list):
-                                    col = cols[i % num_cols]
-                                    file_path = Path(file_path_str)
-
-                                    if file_path.suffix.lower() in ['.jpg', '.jpeg', '.png']:
-                                        try:
-                                            col.image(str(file_path), use_container_width=True)
-                                        except Exception:
-                                            col.warning(f"Invalid image: {file_path.name}")
-                                    
-                                    elif file_path.suffix.lower() in ['.mp4', '.mov', '.avi']:
-                                        col.video(str(file_path))
-                                    else:
-                                        col.warning(f"Unsupported: {file_path.name}")
-                
-                # --- Form Submission Logic ---
-                submitted = st.form_submit_button(
-                    "Apply All Changes", 
-                    type="primary", 
-                    use_container_width=True
-                )
-
-                if submitted:
-                    any_action_taken = False
-                    ids_to_delete = set()
-                    renames_to_perform = []
-
-                    # First, determine all renames and deletions from the form's state
-                    for person_id, person_data in list(st.session_state.people.items()):
-                        if st.session_state.get(f"delete_{person_id}"):
-                            ids_to_delete.add(person_id)
-                            any_action_taken = True
-                        
-                        old_person_name = person_data['name']
-                        new_name_key = f"new_name_{person_id}"
-                        new_name = st.session_state[new_name_key]
-                        sanitized_new_name = "".join(c for c in new_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
-                        
-                        if sanitized_new_name and sanitized_new_name != old_person_name:
-                            renames_to_perform.append((person_id, old_person_name, sanitized_new_name))
-                            any_action_taken = True
-                    
-                    # Perform renames first
-                    for person_id, old_name, new_name in renames_to_perform:
-                        if person_id in st.session_state.people: # Check if person exists
-                            person_data = st.session_state.people[person_id]
-                            
-                            old_dir = os.path.join(OUTPUT_DIR, old_name)
-                            
-                            # Find a unique name for the new directory
-                            unique_new_name = find_unique_name(OUTPUT_DIR, new_name)
-                            new_dir = os.path.join(OUTPUT_DIR, unique_new_name)
-
-                            # Perform rename synchronously
-                            if os.path.isdir(old_dir):
-                                os.rename(old_dir, new_dir)
-                            
-                            # Update all file paths to reflect the new directory
-                            person_data['files'] = {os.path.join(new_dir, os.path.basename(f)) for f in person_data['files']}
-                            
-                            # Update the name in the session state to the (potentially modified) unique name
-                            person_data['name'] = unique_new_name
-
-
-                    # Then, perform deletions
-                    for person_id in ids_to_delete:
-                        # Check if the person still exists before trying to delete
-                        if person_id in st.session_state.people:
-                            person_data = st.session_state.people[person_id]
-                            
-                            # Get the directory from one of the file paths
-                            if person_data['files']:
-                                person_dir = os.path.dirname(list(person_data['files'])[0])
-                                st.session_state.file_op_queue.put(('remove_dir', (person_dir,)))
-
-                            del st.session_state.people[person_id]
-
-                    # Rerun the app once if any action was taken
-                    if any_action_taken:
-                        st.session_state.zip_archive = None
-                        st.rerun()
-
-    elif app_mode == "Diagnostic Tool":
-        st.title("Diagnostic Tool")
-        run_diagnostic_tool()
+    st.write("---")
+    render_groups_section(groups, unsorted_faces, merge_candidates, rescue_map)
+    st.write("---")
+    render_export_section(groups)
 
 
 if __name__ == "__main__":

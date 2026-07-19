@@ -1,75 +1,116 @@
-import os
 import argparse
-from .config import config
-from .media_processor import MediaProcessor
-from .face_detector import FaceDetector
+import sys
+
+import numpy as np
+
+from facesorter.config import config, CROP_DIR, PEOPLE_DB, SCAN_CACHE_DB
+from facesorter.face_clusterer import FaceClusterer
+from facesorter.face_detector import FaceDetector, filter_faces
+from facesorter.file_organizer import FileOrganizer
+from facesorter.media_processor import MediaProcessor
+from facesorter.people_db import PeopleDB
+from facesorter.pipeline import group_faces, match_known_people, scan_files
+from facesorter.scan_cache import ScanCache
+
 
 def main():
-    """Main function to run the face sorter."""
-    parser = argparse.ArgumentParser(description="Detects faces in media and saves the output.")
-    parser.add_argument(
-        "--source",
-        type=str,
-        default="input_media",
-        help="The folder containing the media files to process."
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="output_media",
-        help="The folder where the processed media will be saved."
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="hog",
-        choices=["hog", "cnn"],
-        help="The face detection model to use. 'hog' is faster; 'cnn' is more accurate but slower."
-    )
+    """Headless run of the full scan -> cluster -> export pipeline."""
+    parser = argparse.ArgumentParser(
+        description="Sort a folder of photos into per-person folders based "
+                    "on the faces in them.")
+    parser.add_argument("--source", required=True,
+                        help="Folder of photos to sort (scanned recursively).")
+    parser.add_argument("--output", default=config.get("output.dir", "sorted_output"),
+                        help="Folder to copy the sorted photos into.")
+    parser.add_argument("--det-size", type=int,
+                        default=config.get("detection.det_size", 640),
+                        choices=[640, 1024, 1600],
+                        help="Detector resolution; higher finds smaller faces.")
+    parser.add_argument("--min-confidence", type=float,
+                        default=config.get("detection.min_confidence", 0.5),
+                        help="Ignore faces below this detector confidence.")
+    parser.add_argument("--min-face-height", type=int,
+                        default=config.get("detection.min_face_height", 40),
+                        help="Ignore faces shorter than this many pixels.")
+    parser.add_argument("--eps", type=float,
+                        default=config.get("clustering.eps", 0.5),
+                        help="Max cosine distance to group two faces "
+                             "(lower = stricter).")
+    parser.add_argument("--min-samples", type=int,
+                        default=config.get("clustering.min_samples", 2),
+                        help="Minimum faces to form a group.")
+    parser.add_argument("--match-distance", type=float,
+                        default=config.get("clustering.match_distance", 0.45),
+                        help="Max distance to auto-recognize a saved person "
+                             "from the people database.")
+    parser.add_argument("--ignore-people", action="store_true",
+                        help="Skip matching against saved people; cluster "
+                             "everything fresh.")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Ignore the scan cache and re-detect everything.")
     args = parser.parse_args()
 
-    print("FaceSorter application started.")
-    
-    source_folder = args.source
-    output_folder = args.output
-    
-    # Create output directory if it doesn't exist
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-    
-    media_processor = MediaProcessor(source_folder)
-    face_detector = FaceDetector(model=args.model)
-    
-    print(f"Using '{args.model}' model for face detection.")
-    print(f"Scanning for media in: {source_folder}")
-    image_files, video_files = media_processor.discover_media()
-    
-    print(f"Found {len(image_files)} image files.")
-    for img_path in image_files:
-        print(f"Processing {img_path.name}...")
-        try:
-            image, face_locations = face_detector.detect_faces(img_path)
+    try:
+        paths = MediaProcessor(args.source).discover_media()
+    except FileNotFoundError as e:
+        sys.exit(str(e))
+    if not paths:
+        sys.exit(f"No supported images found in {args.source}")
+    print(f"Found {len(paths)} images in {args.source}")
 
-            if face_locations:
-                print(f"  Found {len(face_locations)} face(s).")
+    cache = None if args.no_cache else ScanCache(SCAN_CACHE_DB)
 
-                # Draw faces
-                image_with_faces = FaceDetector.draw_faces(image, face_locations)
+    def on_progress(done, total, name):
+        print(f"\r  Scanning {done}/{total}: {name[:50]:<50}", end="", flush=True)
 
-                # Save the new image
-                output_path = os.path.join(output_folder, f"detected_{img_path.name}")
-                image_with_faces.save(output_path)
-                print(f"  Saved result to {output_path}")
+    faces, stats = scan_files(
+        paths,
+        det_size=args.det_size,
+        cache=cache,
+        detector_factory=lambda: FaceDetector(det_size=args.det_size,
+                                              crop_dir=CROP_DIR),
+        progress_cb=on_progress,
+    )
+    print()
+    print(f"  {len(faces)} faces found "
+          f"({stats['cached']} files from cache, "
+          f"{stats['unreadable']} unreadable)")
 
-            else:
-                print("  No faces found.")
+    faces = filter_faces(faces, min_score=args.min_confidence,
+                         min_height=args.min_face_height)
+    if not faces:
+        sys.exit("No faces passed the filters — try lowering "
+                 "--min-confidence or --min-face-height.")
 
-        except Exception as e:
-            print(f"  Error processing {img_path.name}: {e}")
+    known_matches, remaining = {}, faces
+    people_names = {}
+    if not args.ignore_people:
+        people_centroids = PeopleDB(PEOPLE_DB).centroids()
+        known_matches, remaining = match_known_people(
+            faces, people_centroids, args.match_distance)
+        people_names = {pid: nc[0] for pid, nc in people_centroids.items()}
+        if known_matches:
+            matched_count = sum(len(v) for v in known_matches.values())
+            print(f"  {matched_count} faces recognized as "
+                  f"{len(known_matches)} saved people")
 
-    print(f"Found {len(video_files)} video files.")
-    for vid in video_files:
-        print(f"  - {vid.name}")
+    if remaining:
+        embeddings = np.stack([f.embedding for f in remaining])
+    else:
+        embeddings = []
+    labels, num_clusters = FaceClusterer(
+        eps=args.eps, min_samples=args.min_samples).cluster_faces(embeddings)
+    groups, unsorted_faces = group_faces(remaining, labels,
+                                         known_matches, people_names)
+    print(f"  {len(faces)} faces -> {len(groups)} people "
+          f"({len(unsorted_faces)} unsorted faces)")
+
+    copied = FileOrganizer(args.output).export(groups)
+    for gid, group in groups.items():
+        print(f"  {group['name']}: {len(group['files'])} photos "
+              f"({copied[gid]} copied)")
+    print(f"Done. Sorted folders are in {args.output}")
+
 
 if __name__ == "__main__":
-    main() 
+    main()

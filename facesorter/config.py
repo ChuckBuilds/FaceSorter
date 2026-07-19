@@ -1,45 +1,39 @@
-import yaml
 import os
+from pathlib import Path
+
+import yaml
 
 # --- Constants ---
-# Define common directories as constants to be used across the application.
-OUTPUT_DIR = "sorted_output"
-TEMP_UPLOAD_DIR = "temp_uploads"
-TEMP_CROP_DIR = "temp_crops"
-BATCH_SIZE = 100 # Default batch size
+REPO_ROOT = Path(__file__).resolve().parent.parent
+APP_DATA_DIR = Path(os.environ.get("FACESORTER_DATA_DIR",
+                                   Path.home() / ".facesorter"))
+SCAN_CACHE_DB = APP_DATA_DIR / "scan_cache.db"
+PEOPLE_DB = APP_DATA_DIR / "people.db"
+CROP_DIR = APP_DATA_DIR / "crops"
+TEMP_UPLOAD_DIR = APP_DATA_DIR / "uploads"
+OUTPUT_DIR = str(REPO_ROOT / "sorted_output")
+
 
 class Config:
-    """A class to manage configuration settings for the FaceSorter application."""
+    """Loads default settings from config.yaml at the repo root."""
 
-    def __init__(self, config_file="config.yaml"):
-        """
-        Initializes the Config object by loading settings from a YAML file.
-
-        Args:
-            config_file (str): The path to the configuration file.
-        """
-        with open(config_file, 'r') as f:
-            self.settings = yaml.safe_load(f)
+    def __init__(self, config_file=None):
+        config_file = config_file or REPO_ROOT / "config.yaml"
+        try:
+            with open(config_file, "r") as f:
+                self.settings = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            self.settings = {}
 
     def get(self, key, default=None):
-        """
-        Retrieves a configuration value for a given key.
-
-        Args:
-            key (str): The configuration key to retrieve, using dot notation for nested keys.
-            default: The default value to return if the key is not found.
-
-        Returns:
-            The configuration value or the default value.
-        """
-        keys = key.split('.')
+        """Retrieves a value by dot-notation key, e.g. 'clustering.eps'."""
         value = self.settings
         try:
-            for k in keys:
+            for k in key.split("."):
                 value = value[k]
             return value
         except (KeyError, TypeError):
             return default
 
-# A global instance of the Config class to be used throughout the application
-config = Config() 
+
+config = Config()
